@@ -37,6 +37,85 @@
 
 结论：核心流程一致，multi-head 只是多了 head 维度的重排。
 
+### 1.4 对应流程图（含 shape / 算子 / 输入输出名）
+
+#### Single-Head + KV Cache
+
+```mermaid
+flowchart TD
+	X[x\nshape: B x T x D]
+	C[cache\nkeys: k,v\nshape(k/v): B x T_cache x D]
+
+	Q[q_proj (Linear)\ninput: x\noutput: q\nshape: B x T x D]
+	K[k_proj (Linear)\ninput: x\noutput: k_new\nshape: B x T x D]
+	V[v_proj (Linear)\ninput: x\noutput: v_new\nshape: B x T x D]
+
+	CATK[cat dim=1\ninputs: past_k, k_new\noutput: k\nshape: B x T_total x D]
+	CATV[cat dim=1\ninputs: past_v, v_new\noutput: v\nshape: B x T_total x D]
+
+	S1[transpose\ninput: k\noutput: k^T\nshape: B x D x T_total]
+	S2[matmul + scale 1/sqrt(D)\ninputs: q, k^T\noutput: scores\nshape: B x T x T_total]
+	S3[softmax dim=-1\ninput: scores\noutput: attn\nshape: B x T x T_total]
+	S4[matmul\ninputs: attn, v\noutput: context\nshape: B x T x D]
+	O[out_proj (Linear)\ninput: context\noutput: out\nshape: B x T x D]
+
+	NC[new_cache\n{k,v}\nshape(k/v): B x T_total x D]
+
+	X --> Q
+	X --> K
+	X --> V
+	C --> CATK
+	C --> CATV
+	K --> CATK
+	V --> CATV
+	CATK --> S1 --> S2 --> S3 --> S4 --> O
+	Q --> S2
+	CATV --> S4
+	CATK --> NC
+	CATV --> NC
+```
+
+#### Multi-Head + KV Cache
+
+```mermaid
+flowchart TD
+	X[x\nshape: B x T x D]
+	C[cache\nkeys: k,v\nshape(k/v): B x H x T_cache x Hd]
+
+	Q0[q_proj (Linear)\ninput: x\noutput: q0\nshape: B x T x D]
+	K0[k_proj (Linear)\ninput: x\noutput: k0\nshape: B x T x D]
+	V0[v_proj (Linear)\ninput: x\noutput: v0\nshape: B x T x D]
+
+	QS[split_heads (view+transpose)\ninput: q0\noutput: q\nshape: B x H x T x Hd]
+	KS[split_heads (view+transpose)\ninput: k0\noutput: k_new\nshape: B x H x T x Hd]
+	VS[split_heads (view+transpose)\ninput: v0\noutput: v_new\nshape: B x H x T x Hd]
+
+	CATK[cat dim=2\ninputs: past_k, k_new\noutput: k\nshape: B x H x T_total x Hd]
+	CATV[cat dim=2\ninputs: past_v, v_new\noutput: v\nshape: B x H x T_total x Hd]
+
+	S1[transpose\ninput: k\noutput: k^T\nshape: B x H x Hd x T_total]
+	S2[matmul + scale 1/sqrt(Hd)\ninputs: q, k^T\noutput: scores\nshape: B x H x T x T_total]
+	S3[softmax dim=-1\ninput: scores\noutput: attn\nshape: B x H x T x T_total]
+	S4[matmul\ninputs: attn, v\noutput: context_h\nshape: B x H x T x Hd]
+	MG[merge_heads (transpose+view)\ninput: context_h\noutput: context\nshape: B x T x D]
+	O[out_proj (Linear)\ninput: context\noutput: out\nshape: B x T x D]
+
+	NC[new_cache\n{k,v}\nshape(k/v): B x H x T_total x Hd]
+
+	X --> Q0 --> QS
+	X --> K0 --> KS
+	X --> V0 --> VS
+	C --> CATK
+	C --> CATV
+	KS --> CATK
+	VS --> CATV
+	CATK --> S1 --> S2 --> S3 --> S4 --> MG --> O
+	QS --> S2
+	CATV --> S4
+	CATK --> NC
+	CATV --> NC
+```
+
 ---
 
 ## 2. 内存使用差异
