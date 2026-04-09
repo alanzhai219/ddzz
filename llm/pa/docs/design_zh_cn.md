@@ -2,6 +2,8 @@
 
 本文档面向想理解 paged attention 运行时核心机制的读者，重点解释这个教学项目的流程、设计原理，以及各层之间如何配合工作。
 
+>| refer to blog: https://hackmd.io/@chrischang80/H1pGnECfex
+
 这份实现不是为了追求最高性能，而是为了把下面这条主线讲清楚：
 
 1. 序列如何映射到物理 KV block
