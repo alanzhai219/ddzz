@@ -44,10 +44,7 @@ class MultiHeadAttentionInference(nn.Module):
         return x.transpose(1, 2).contiguous().view(b, s, self.embed_dim)
 
     @torch.inference_mode()
-    def forward(
-        self,
-        x: torch.Tensor,
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, use_sdpa: bool = False, is_causal: bool = False) -> torch.Tensor:
         """Compute classic multi-head self-attention in inference mode."""
         if x.dim() != 3:
             raise ValueError("x must be [B, S, D]")
@@ -59,15 +56,22 @@ class MultiHeadAttentionInference(nn.Module):
         k = self._split_heads(self.k_proj(x))
         v = self._split_heads(self.v_proj(x))
 
-        # [B, H, S, Hd] x [B, H, Hd, S] -> [B, H, S, S]
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        if use_sdpa:
+            # F.scaled_dot_product_attention expects [B, ..., S, D]
+            # For multi-head, it treats the last two dims as (S, Hd) and broadcasts over heads.
+            context = nn.functional.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
+        else:
+            # [B, H, S, Hd] x [B, H, Hd, S] -> [B, H, S, S]
+            scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            if is_causal:
+                causal_mask = torch.triu(torch.full((s, s), float("-inf"), device=scores.device), diagonal=1)
+                scores = scores + causal_mask
+            attn = torch.softmax(scores, dim=-1)
 
-        attn = torch.softmax(scores, dim=-1)
-
-        # [B, H, S, S] x [B, H, S, Hd] -> [B, H, S, Hd]
-        context = torch.matmul(attn, v)
+            # [B, H, S, S] x [B, H, S, Hd] -> [B, H, S, Hd]
+            context = torch.matmul(attn, v)
+        
         context = self._merge_heads(context)
-
         out = self.out_proj(context)
 
         return out
@@ -82,5 +86,11 @@ if __name__ == "__main__":
     attn.eval()
 
     y = attn(x)
-    print("input:", x.shape)
-    print("output:", y.shape)
+    y_sdpa = attn(x, use_sdpa=True)
+    print("manual:", y.shape)
+    print("sdpa:  ", y_sdpa.shape)
+    print("max diff (no causal):", (y - y_sdpa).abs().max().item())
+
+    y_causal = attn(x, is_causal=True)
+    y_sdpa_causal = attn(x, use_sdpa=True, is_causal=True)
+    print("max diff (causal):   ", (y_causal - y_sdpa_causal).abs().max().item())
