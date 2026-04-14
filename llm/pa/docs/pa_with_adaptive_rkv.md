@@ -73,6 +73,72 @@ Paged Attention 的核心思路，就是把 KV Cache 像分页内存一样管理
 - `past_lens` 是逻辑长度
 - `subsequence_begins` 是这轮输入 token 的分段信息
 
+### 2.1 KV Cache Shape 与量化粒度
+
+为了看懂量化 KV cache 的 shape，先约定 4 个符号：
+
+| 符号 | 含义 | 对应变量 |
+| --- | --- | --- |
+| `N` | cache block 数 | `kNumBlocks` |
+| `H` | KV head 数 | `kHeadNum` |
+| `B` | 每个 block 的 token 数 | `kBlockSize` |
+| `S` | 每个 head 的 hidden size | `kHeadSize` |
+
+在不量化时，KV cache 的逻辑基形状就是：
+
+```text
+[N, H, B, S]
+```
+
+量化后，shape 会因为量化参数的存储方式而变化。
+
+#### Key Cache Shape
+
+| 精度 / 模式 | Shape | 原因 |
+| --- | --- | --- |
+| `float` | `[N, H, B, S]` | 没有量化参数，纯数据 |
+| `u8 by-channel` | `[N, H, B + 8, S]` | 每个 channel 需要 `scale + zp`，共 2 个 `float = 8` 字节，头信息加在 `B` 维 |
+| `u8 by-token` | `[N, H, B, S + 8]` | 每个 token 需要 `scale + zp`，共 8 字节，头信息加在 `S` 维 |
+| `i8 by-token` | `[N, H, B, S + 4]` | 对称量化只需要 1 个 `float scale`，不需要 `zp` |
+| `u4 by-channel` | `[N, H, B + 16, S]` | 仍然需要 `scale + zp = 8` 字节，但 shape 单位是 `u4` 元素，`8 / 0.5 = 16` |
+| `u4 by-token` | `[N, H, B, S + 16]` | 同上，只是头信息加在 `S` 维 |
+
+#### Value Cache Shape
+
+这个测试里 value cache 永远按 by-token 组织，因此没有 by-channel 的 value cache 变体。
+
+| 精度 / 模式 | Shape | 原因 |
+| --- | --- | --- |
+| `float` | `[N, H, B, S]` | 没有量化参数 |
+| `u8 by-token` | `[N, H, B, S + 8]` | 每个 token 存一组 `scale + zp` |
+| `i8` 场景下的 value cache | `[N, H, B, S + 8]` | 这里 key 是 `i8`，但 value 被 SageAttn 强制成 `u8 by-token` |
+| `u4 by-token` | `[N, H, B, S + 16]` | 每个 token 存一组 `scale + zp`，按 `u4` 元素计数后是 `+16` |
+
+#### `by-channel` 与 `by-token` 分别是在哪个维度上量化
+
+这两个名字描述的不是“参数存在哪一维”，而是“量化参数沿哪一维共享”。
+
+| 模式 | 量化 / 反量化粒度 | 共享关系 | 存储头放在哪一维 |
+| --- | --- | --- | --- |
+| `by-channel` | 固定一个 `(block, head)`，对每个 `S` 通道分别量化 | 同一通道的参数在 `B` 个 token 上共享 | `B` 维 |
+| `by-token` | 固定一个 `(block, head, token)`，对该 token 的整条 `S` 向量量化 | 该 token 的一组参数覆盖整条 `S` | `S` 维 |
+
+也可以把它们理解成：
+
+```text
+by-channel: 沿 B 维统计，对 S 维逐通道量化
+by-token:   固定一个 token，对该 token 的整条 S 向量量化
+```
+
+对 `u8/u4 by-channel` 而言，量化参数是“每个 channel 一组，跨 block 内所有 token 共享”；
+对 `u8/i8/u4 by-token` 而言，量化参数是“每个 token 一组，覆盖该 token 的整条 hidden 向量”。
+
+一个容易混淆但很重要的点是：
+
+1. `by-channel` 在逻辑上是“按 `S` 分参数，跨 `B` 共享”。
+2. `by-token` 在逻辑上是“按 token 分参数，覆盖整条 `S`”。
+3. shape 中参数头加在 `B` 维还是 `S` 维，只是存储布局，不改变上面的共享语义。
+
 ---
 
 ## 3. KV Cache 的分页管理直觉
@@ -756,7 +822,7 @@ shape = [eviction_size / block_size, eviction_size] = [1, 2]
 
 ---
 
-# 11. 用一组具体数字，手工推演完整流程
+## 11. 用一组具体数字，手工推演完整流程
 
 下面给一个最小但完整的例子，把：
 
