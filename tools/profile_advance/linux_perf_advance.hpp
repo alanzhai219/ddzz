@@ -2,9 +2,13 @@
 
 #ifdef __cplusplus
 
+// ============================================================================
+// Section: Platform Includes and Low-Level Intrinsics
+// System headers, perf_event_open syscall wrapper, and X86_RAW_EVENT macro.
+// ============================================================================
+
 #include <linux/perf_event.h>
 #include <time.h>
-//#include <linux/time.h>
 #include <sched.h>
 #include <unistd.h>
 #include <sys/syscall.h>
@@ -31,8 +35,6 @@ inline int perf_event_open(struct perf_event_attr *attr, pid_t pid, int cpu, int
 #include <vector>
 #include <atomic>
 #include <sys/mman.h>
-#include <chrono>
-#include <thread>
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -52,8 +54,8 @@ inline int perf_event_open(struct perf_event_attr *attr, pid_t pid, int cpu, int
 RAW HARDWARE EVENT DESCRIPTOR
        Even when an event is not available in a symbolic form within perf right now, it can be encoded in a per processor specific way.
 
-       For instance For x86 CPUs NNN represents the raw register encoding with the layout of IA32_PERFEVTSELx MSRs (see [Intel® 64 and IA-32 Architectures Software Developer’s Manual Volume 3B: System Programming Guide] Figure 30-1
-       Layout of IA32_PERFEVTSELx MSRs) or AMD’s PerfEvtSeln (see [AMD64 Architecture Programmer’s Manual Volume 2: System Programming], Page 344, Figure 13-7 Performance Event-Select Register (PerfEvtSeln)).
+       For instance For x86 CPUs NNN represents the raw register encoding with the layout of IA32_PERFEVTSELx MSRs (see [Intel® 64 and IA-32 Architectures Software Developer's Manual Volume 3B: System Programming Guide] Figure 30-1
+       Layout of IA32_PERFEVTSELx MSRs) or AMD's PerfEvtSeln (see [AMD64 Architecture Programmer's Manual Volume 2: System Programming], Page 344, Figure 13-7 Performance Event-Select Register (PerfEvtSeln)).
 
        Note: Only the following bit fields can be set in x86 counter registers: event, umask, edge, inv, cmask. Esp. guest/host only and OS/user mode flags must be setup using EVENT MODIFIERS.
 
@@ -67,17 +69,26 @@ RAW HARDWARE EVENT DESCRIPTOR
 
 namespace LinuxPerf {
 
-// Design overview:
-// 1. PerfRawConfig parses the LINUX_PERF environment variable.
-// 2. PerfEventGroup measures per-thread counters and optional trace scopes.
-// 3. PerfEventContextSwitch captures CPU-wide context-switch records for timeline view.
-// 4. PerfEventJsonDumper collects all dumpers and writes a single perf_dump.json.
+// ============================================================================
+// Design overview (4 core components):
+//
+// 1. PerfConfig     -- parses the LINUX_PERF environment variable.
+// 2. PerfCounterGroup    -- per-thread HW/SW counter group with ProfileScope RAII.
+// 3. CpuContextSwitchTracker -- per-CPU context-switch ring buffer for timeline view.
+// 4. TraceFileWriter       -- aggregates all dumpers, writes a single perf_dump.json.
+// ============================================================================
 
-#define _LINE_STRINGIZE(x) _LINE_STRINGIZE2(x)
-#define _LINE_STRINGIZE2(x) #x
-#define LINE_STRING _LINE_STRINGIZE(__LINE__)
+// ============================================================================
+// Section: Logging Utilities
+// Diagnostic printf/perror helpers used throughout the library.
+// ============================================================================
 
-#define LINUX_PERF_ "\e[33m[LINUX_PERF:" LINE_STRING "]\e[0m "
+// Two-level stringize: #x stringizes literally without macro expansion,
+// so STRINGIFY(EXPAND(__LINE__)) is needed to get "42" instead of "__LINE__".
+#define STRINGIFY_LITERAL(x) #x
+#define STRINGIFY_EXPAND(x) STRINGIFY_LITERAL(x)
+
+#define LINUX_PERF_ "\e[33m[LINUX_PERF:" STRINGIFY_EXPAND(__LINE__) "]\e[0m "
 
 inline void log_printf(const char* format, ...) {
     va_list args;
@@ -99,12 +110,18 @@ inline void abort_with_perror(const char* message) {
     abort();
 }
 
+// ============================================================================
+// Section: Timestamp Infrastructure
+// get_time_ns(), read_tsc(), read_pmc(), and TimestampConverter for converting
+// raw monotonic timestamps (nanoseconds) to microseconds for trace output.
+// ============================================================================
+
 inline uint64_t get_time_ns() {
     struct timespec tp0;
     if (clock_gettime(CLOCK_MONOTONIC_RAW, &tp0) != 0) {
         abort_with_perror(LINUX_PERF_"clock_gettime(CLOCK_MONOTONIC_RAW,...) failed!");
     }
-    return (tp0.tv_sec * 1000000000) + tp0.tv_nsec;    
+    return (tp0.tv_sec * 1000000000) + tp0.tv_nsec;
 }
 
 #ifdef __x86_64__
@@ -138,91 +155,112 @@ inline uint64_t read_pmc(int index) {
 }
 #endif
 
-struct TscCounter {
-    uint64_t tsc_ticks_per_second;
-    uint64_t tsc_ticks_base;
-    double tsc_to_usec(uint64_t tsc_ticks) const {
-        if (tsc_ticks < tsc_ticks_base) {
+// Converts raw CLOCK_MONOTONIC_RAW nanosecond timestamps to microseconds
+// relative to a base point (captured at construction time).
+// Despite the legacy name "tsc", this now uses clock_gettime directly,
+// avoiding the ~1s calibration sleep that a real TSC approach would need.
+struct TimestampConverter {
+    uint64_t ticks_per_second;
+    uint64_t base_tick;
+
+    // Convert an absolute timestamp to microseconds relative to base.
+    double ticks_to_usec(uint64_t ticks) const {
+        if (ticks < base_tick) {
             return 0;
         }
-        return (tsc_ticks - tsc_ticks_base) * 1000000.0 / tsc_ticks_per_second;
+        return (ticks - base_tick) * 1000000.0 / ticks_per_second;
     }
-    double tsc_to_usec(uint64_t tsc_ticks0, uint64_t tsc_ticks1) const {
-        if (tsc_ticks1 < tsc_ticks0) {
+
+    // Convert a [start, end] timestamp pair to a duration in microseconds.
+    double duration_usec(uint64_t start_ticks, uint64_t end_ticks) const {
+        if (end_ticks < start_ticks) {
             return 0;
         }
-        return (tsc_ticks1 - tsc_ticks0) * 1000000.0 / tsc_ticks_per_second;
+        return (end_ticks - start_ticks) * 1000000.0 / ticks_per_second;
     }
-    TscCounter() {
+
+    TimestampConverter() {
         // Use CLOCK_MONOTONIC_RAW as unified time source (unit: nanoseconds).
         // This avoids the ~1s calibration sleep that a TSC-based approach would need,
         // and stays consistent with the clockid used in perf_event_attr.
-        tsc_ticks_per_second = 1000000000; // ns
-        tsc_ticks_base = get_time_ns();
+        ticks_per_second = 1000000000; // ns
+        base_tick = get_time_ns();
     }
 };
 
-class IPerfEventDumper {
+// ============================================================================
+// Section: Trace Output -- Dumper Interface and JSON Writer
+// ITraceEventDumper interface, TraceFileWriter singleton (Chrome Trace format
+// output), and CrossLibrarySingleton for shared-memory based process-wide
+// singleton that survives across multiple .so boundaries.
+// ============================================================================
+
+// Interface that any component must implement to contribute trace events
+// to the final perf_dump.json output file.
+class ITraceEventDumper {
 public:
-    virtual ~IPerfEventDumper() = default;
-    virtual void dump_json(std::ofstream& fw, TscCounter& tsc) = 0;
+    virtual ~ITraceEventDumper() = default;
+    virtual void dump_json(std::ofstream& fw, TimestampConverter& tsc) = 0;
 };
 
-struct PerfEventJsonDumper {
-    std::mutex g_mutex;
-    std::set<IPerfEventDumper*> all_dumpers;
-    const char* dump_file_name = "perf_dump.json";
-    bool dump_file_over = false;
-    bool not_finalized = true;
-    std::ofstream fw;
-    std::atomic_int totalProfilerManagers{0};
-    TscCounter tsc;
+// Aggregates all registered ITraceEventDumper instances and writes a single
+// perf_dump.json in Chrome Trace Event Format (viewable in chrome://tracing
+// or Perfetto).  Uses a cross-library singleton to ensure exactly one writer
+// per process, even when this header is compiled into multiple shared libraries.
+struct TraceFileWriter {
+    std::mutex writer_mutex;
+    std::set<ITraceEventDumper*> registered_dumpers;
+    const char* output_filename = "perf_dump.json";
+    bool needs_finalization = true;
+    std::ofstream output_stream;
+    std::atomic_int registered_dumper_count{0};
+    TimestampConverter timestamp_converter;
 
-    ~PerfEventJsonDumper() {
-        if (not_finalized) {
-            finalize();
+    ~TraceFileWriter() {
+        if (needs_finalization) {
+            flush_and_close();
         }
     }
 
-    void finalize() {
-        if (!not_finalized) {
+    // Write all registered dumpers' data to the output JSON file, then close it.
+    void flush_and_close() {
+        if (!needs_finalization) {
             return;
         }
-        std::lock_guard<std::mutex> guard(g_mutex);
+        std::lock_guard<std::mutex> guard(writer_mutex);
         // Re-check under lock to prevent double finalization from concurrent threads.
-        if (!not_finalized || dump_file_over || all_dumpers.empty()) {
+        if (!needs_finalization || registered_dumpers.empty()) {
             return;
         }
 
         // start dump
-        fw.open(dump_file_name, std::ios::out);
-        fw << "{\n";
-        fw << "\"schemaVersion\": 1,\n";
-        fw << "\"traceEvents\": [\n";
-        fw.flush();
+        output_stream.open(output_filename, std::ios::out);
+        output_stream << "{\n";
+        output_stream << "\"schemaVersion\": 1,\n";
+        output_stream << "\"traceEvents\": [\n";
+        output_stream.flush();
 
-        for (auto& pthis : all_dumpers) {
-            pthis->dump_json(fw, tsc);
+        for (auto& pthis : registered_dumpers) {
+            pthis->dump_json(output_stream, timestamp_converter);
         }
-        all_dumpers.clear();
+        registered_dumpers.clear();
 
-        fw << R"({
+        output_stream << R"({
             "name": "Profiler End",
             "ph": "i",
             "s": "g",
             "pid": "Traces",
             "tid": "Trace OV Profiler",
             "ts":)"
-           << tsc.tsc_to_usec(get_time_ns()) << "}";
-        fw << "]\n";
-        fw << "}\n";
-        auto total_size = fw.tellp();
-        fw.close();
-        dump_file_over = true;
-        not_finalized = false;
+           << timestamp_converter.ticks_to_usec(get_time_ns()) << "}";
+        output_stream << "]\n";
+        output_stream << "}\n";
+        auto total_size = output_stream.tellp();
+        output_stream.close();
+        needs_finalization = false;
 
         std::cout << LINUX_PERF_"Dumped ";
-        
+
         if (total_size < 1024) {
             std::cout << total_size << " bytes ";
         } else if (total_size < 1024*1024) {
@@ -230,71 +268,90 @@ struct PerfEventJsonDumper {
         } else {
             std::cout << total_size/(1024 * 1024) << " MB ";
         }
-        std::cout << " to " << dump_file_name << std::endl;
+        std::cout << " to " << output_filename << std::endl;
     }
 
-    int register_manager(IPerfEventDumper* pthis) {
-        std::lock_guard<std::mutex> guard(g_mutex);
+    int register_dumper(ITraceEventDumper* pthis) {
+        std::lock_guard<std::mutex> guard(writer_mutex);
         std::ostringstream ss;
-        auto serial_id = totalProfilerManagers.fetch_add(1);
+        auto serial_id = registered_dumper_count.fetch_add(1);
         ss << LINUX_PERF_"#" << serial_id << "(" << pthis << ") : is registered." << std::endl;
         log_message(ss.str());
-        all_dumpers.emplace(pthis);
+        registered_dumpers.emplace(pthis);
         return serial_id;
     }
 
-    // local C++ static-based singleton fails when this header-only tool is being
-    // used by two separate shared libs (or one by shared lib, another by final application exe)
+    // Cross-library singleton via POSIX shared memory.
     //
+    // Problem: a C++ static-local singleton in a header-only library gets a
+    // separate instance in each .so that includes the header.  We need exactly
+    // one TraceFileWriter per process.
+    //
+    // Solution: use shm_open to create a process-wide shared memory region that
+    // stores a pointer to the single heap-allocated instance.
+    //
+    // Protocol:
+    //   1. All users in the same process shm_open the same named region.
+    //   2. The first to CAS init_lock_pid owns initialization (creates the object).
+    //   3. Others spin on init_done_pid until the owner signals completion.
+    //   4. Reference counting via reference_count controls destruction.
     template<class T>
-    struct singleton_over_so {
+    struct CrossLibrarySingleton {
         static constexpr const char * shm_name = "/linuxperf_shm01";
-        struct shm_data {
-            T * pobj;
-            int64_t ref_cnt;
-            pid_t pid_spinlock0;
-            pid_t pid_spinlock1;
+
+        // Layout of the shared memory region (fits in one page).
+        struct SharedMemoryBlock {
+            T * instance_ptr;
+            int64_t reference_count;
+            pid_t init_lock_pid;    // PID that claimed the initialization lock
+            pid_t init_done_pid;    // set to PID when initialization is complete
         };
-        shm_data* _data;
-        T * pobj;
-        singleton_over_so() {
+
+        SharedMemoryBlock* shared_block;
+        T * instance_ptr;
+
+        CrossLibrarySingleton() {
             int fd = shm_open(shm_name, O_CREAT | O_RDWR, 0600);
             if (ftruncate(fd, 4096) != 0) {
                 abort_with_perror("ftruncate failed!");
             }
             pid_t pid = getpid();
-            _data = reinterpret_cast<shm_data*>(mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
-            if (__atomic_exchange_n(&_data->pid_spinlock0, pid, __ATOMIC_SEQ_CST) != pid) {
-                // we are the first one that set pid_spinlock to pid, do initialization
-                _data->pobj = new T();
-                __atomic_store_n(&_data->ref_cnt, 0, __ATOMIC_SEQ_CST);
-                __atomic_store_n(&_data->pid_spinlock1, pid, __ATOMIC_SEQ_CST);
+            shared_block = reinterpret_cast<SharedMemoryBlock*>(mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
+            if (__atomic_exchange_n(&shared_block->init_lock_pid, pid, __ATOMIC_SEQ_CST) != pid) {
+                // we are the first one that set init_lock_pid to pid, do initialization
+                shared_block->instance_ptr = new T();
+                __atomic_store_n(&shared_block->reference_count, 0, __ATOMIC_SEQ_CST);
+                __atomic_store_n(&shared_block->init_done_pid, pid, __ATOMIC_SEQ_CST);
             } else {
                 // spin until the owner has done
-                while (__atomic_load_n(&_data->pid_spinlock1, __ATOMIC_SEQ_CST) != pid);
+                while (__atomic_load_n(&shared_block->init_done_pid, __ATOMIC_SEQ_CST) != pid);
             }
-            __atomic_add_fetch(&_data->ref_cnt, 1, __ATOMIC_SEQ_CST);
+            __atomic_add_fetch(&shared_block->reference_count, 1, __ATOMIC_SEQ_CST);
             close(fd);
 
-            pobj = _data->pobj;
+            instance_ptr = shared_block->instance_ptr;
         }
         T& obj() {
-            return *(pobj);
+            return *(instance_ptr);
         }
-        ~singleton_over_so() {
-            if (__atomic_sub_fetch(&_data->ref_cnt, 1, __ATOMIC_SEQ_CST) == 0) {
-                delete _data->pobj;
-                munmap(_data, 4096);
+        ~CrossLibrarySingleton() {
+            if (__atomic_sub_fetch(&shared_block->reference_count, 1, __ATOMIC_SEQ_CST) == 0) {
+                delete shared_block->instance_ptr;
+                munmap(shared_block, 4096);
             }
             shm_unlink(shm_name);
         }
     };
 
-    static PerfEventJsonDumper& get() {
-        static singleton_over_so<PerfEventJsonDumper> inst;
+    static TraceFileWriter& get() {
+        static CrossLibrarySingleton<TraceFileWriter> inst;
         return inst.obj();
     }
 };
+
+// ============================================================================
+// Section: String Utilities
+// ============================================================================
 
 inline std::vector<std::string> str_split(const std::string& s, std::string delimiter) {
     std::vector<std::string> ret;
@@ -305,13 +362,31 @@ inline std::vector<std::string> str_split(const std::string& s, std::string deli
     size_t last = 0;
     size_t next = 0;
     while ((next = s.find(delimiter, last)) != std::string::npos) {
-        //std::cout << last << "," << next << "=" << s.substr(last, next-last) << "\n";
         ret.push_back(s.substr(last, next-last));
         last = next + delimiter.size();
     }
     ret.push_back(s.substr(last));
     return ret;
 }
+
+// Parse a list of 1-3 hex/decimal values into an X86_RAW_EVENT config.
+// Accepts any single-character delimiter (e.g. "-" from env var, "," from EventSpec).
+inline uint64_t parse_raw_event_values(const std::vector<std::string>& parts) {
+    if (parts.empty()) { return 0; }
+    auto evsel = std::strtoull(parts[0].c_str(), nullptr, 0);
+    if (parts.size() == 1) { return evsel; }
+    auto umask = std::strtoull(parts[1].c_str(), nullptr, 0);
+    uint64_t cmask = 0;
+    if (parts.size() >= 3) {
+        cmask = std::strtoull(parts[2].c_str(), nullptr, 0);
+    }
+    return X86_RAW_EVENT(evsel, umask, cmask);
+}
+
+// ============================================================================
+// Section: perf_event_attr Helpers and Ring Buffer Primitives
+// Factory for perf_event_attr, RAII try-lock, ring buffer read/release helpers.
+// ============================================================================
 
 inline perf_event_attr make_perf_event_attr(uint32_t type,
                                             uint64_t config,
@@ -336,11 +411,13 @@ inline perf_event_attr make_perf_event_attr(uint32_t type,
     return pea;
 }
 
-// Small RAII helper to ensure lock release on every return path.
-class AtomicSpinGuard {
+// RAII guard that performs a single atomic try-lock (not a spin).
+// If the lock was already held, owns_lock() returns false and the
+// destructor is a no-op.
+class AtomicTryLockGuard {
 public:
-    explicit AtomicSpinGuard(std::atomic<int>& lock) : lock_(lock), owns_(lock_.exchange(1) == 0) {}
-    ~AtomicSpinGuard() {
+    explicit AtomicTryLockGuard(std::atomic<int>& lock) : lock_(lock), owns_(lock_.exchange(1) == 0) {}
+    ~AtomicTryLockGuard() {
         if (owns_) {
             lock_.store(0);
         }
@@ -352,6 +429,8 @@ private:
     bool owns_;
 };
 
+// Read a value of type T from the perf ring buffer at the given offset,
+// handling wrap-around via (offset % data_size).  Advances offset by sizeof(T).
 template<typename T>
 T& read_ring_buffer(perf_event_mmap_page& meta, uint64_t& offset) {
     auto offset0 = offset;
@@ -388,17 +467,25 @@ inline perf_event_mmap_page* map_perf_event_metadata_or_abort(int fd, size_t mma
     return pmeta;
 }
 
-struct RingBufferCursor {
+// Cursor for sequentially reading fields from a perf ring buffer.
+// The offset increases monotonically; physical wrap-around is handled
+// internally by read_ring_buffer via (offset % data_size).
+struct RingBufferReader {
     perf_event_mmap_page& meta;
     uint64_t offset;
 
-    RingBufferCursor(perf_event_mmap_page& meta, uint64_t offset) : meta(meta), offset(offset) {}
+    RingBufferReader(perf_event_mmap_page& meta, uint64_t offset) : meta(meta), offset(offset) {}
 
     template<typename T>
     T read() {
         return read_ring_buffer<T>(meta, offset);
     }
 };
+
+// ============================================================================
+// Section: Context Switch Record Parsing
+// Deserializes a single PERF_RECORD_SWITCH_CPU_WIDE entry from the ring buffer.
+// ============================================================================
 
 struct ContextSwitchRecord {
     uint32_t type = 0;
@@ -412,7 +499,7 @@ struct ContextSwitchRecord {
     uint32_t cpu = 0;
     uint32_t reserved0 = 0;
 
-    static ContextSwitchRecord parse(RingBufferCursor& cursor) {
+    static ContextSwitchRecord parse(RingBufferReader& cursor) {
         ContextSwitchRecord record;
         record.type = cursor.read<__u32>();
         record.misc = cursor.read<__u16>();
@@ -430,17 +517,24 @@ struct ContextSwitchRecord {
     }
 };
 
+// ============================================================================
+// Section: Type-Erased Extra Data Storage
+// Allows attaching arbitrary typed arguments (int, float, double, pointer,
+// vector) to trace events.  Each value is tagged with a single char
+// ('i', 'f', 'p', 'v') and serialized into the Chrome Trace "args" JSON.
+// ============================================================================
+
 template<int Size>
-struct ExtraDataStorage {
-    union Value {
+struct TypeErasedArgStorage {
+    union TaggedValue {
         double f;
         int64_t i;
         void* p;
     };
-    Value values[Size];
-    char types[Size];
+    TaggedValue values[Size];
+    char types[Size];       // tag per slot: 'i'=int, 'f'=float, 'p'=pointer, 'v'=vector, '\0'=end
 
-    ExtraDataStorage() : types() {}
+    TypeErasedArgStorage() : types() {}
 
     // Compile-time type tag deduction.
     template<typename T>
@@ -543,45 +637,48 @@ struct ExtraDataStorage {
     }
 };
 
-struct PerfRawConfig {
-    // --- data members ---
-    int64_t dump = 0;
-    cpu_set_t cpu_mask;
-    bool switch_cpu = false;
-    std::vector<std::pair<std::string, uint64_t>> raw_configs;
+// ============================================================================
+// Section: Environment Variable Configuration
+// Parses the LINUX_PERF environment variable into dump limits, CPU masks,
+// raw PMU event configs, and context-switch mode.
+//
+// Format:  LINUX_PERF=opt1:opt2:...
+//   dump           -- enable JSON dump (unlimited)
+//   dump=N         -- limit to N dumps per thread
+//   cpus=C1,C2,... -- restrict dump/context-switch to listed CPUs
+//   switch-cpu     -- enable per-CPU context-switch timeline
+//   NAME=0xCONFIG  -- add a raw PMU counter (hex or EventSel-UMask-CMask)
+// ============================================================================
 
-    uint64_t parse_raw_event_config(const std::string& raw_evt) const {
-        // raw config format: 0x10d1 or EventSel-UMask-0
-        if (raw_evt.find('-') != std::string::npos) {
-            auto evsel_umask_cmask = str_split(raw_evt, "-");
-            if (evsel_umask_cmask.size() < 2) {
-                return 0;
-            }
-            auto evsel = strtoul(evsel_umask_cmask[0].c_str(), nullptr, 0);
-            auto umask = strtoul(evsel_umask_cmask[1].c_str(), nullptr, 0);
-            uint64_t cmask = 0;
-            if (evsel_umask_cmask.size() > 2) {
-                cmask = strtoul(evsel_umask_cmask[2].c_str(), nullptr, 0);
-            }
-            return X86_RAW_EVENT(evsel, umask, cmask);
-        }
-        return strtoul(raw_evt.c_str(), nullptr, 0);
+struct PerfConfig {
+    // --- data members ---
+    int64_t dump_limit = 0;                                     // 0 = dump disabled
+    cpu_set_t cpu_affinity_mask;
+    bool context_switch_enabled = false;
+    std::vector<std::pair<std::string, uint64_t>> custom_pmu_events;
+
+    // Parse a hex or dash-separated PMU event config string.
+    // Formats: "0x10d1" or "EventSel-UMask-CMask"
+    uint64_t parse_pmu_event_hex(const std::string& raw_evt) const {
+        auto delimiter = (raw_evt.find('-') != std::string::npos) ? "-" : "";
+        auto parts = delimiter[0] ? str_split(raw_evt, delimiter) : std::vector<std::string>{raw_evt};
+        return parse_raw_event_values(parts);
     }
 
     void parse_cpu_list(const std::string& value) {
         // cpus=56 or cpus=56,57,59
         auto cpus = str_split(value, ",");
-        CPU_ZERO(&cpu_mask);
+        CPU_ZERO(&cpu_affinity_mask);
         for (auto& cpu : cpus) {
-            CPU_SET(std::atoi(cpu.c_str()), &cpu_mask);
+            CPU_SET(std::atoi(cpu.c_str()), &cpu_affinity_mask);
         }
     }
 
-    void enable_switch_cpu_mode() {
-        // get cpu_mask as early as possible
-        switch_cpu = true;
-        CPU_ZERO(&cpu_mask);
-        if (sched_getaffinity(getpid(), sizeof(cpu_set_t), &cpu_mask)) {
+    void enable_context_switch_tracking() {
+        // get cpu_affinity_mask as early as possible
+        context_switch_enabled = true;
+        CPU_ZERO(&cpu_affinity_mask);
+        if (sched_getaffinity(getpid(), sizeof(cpu_set_t), &cpu_affinity_mask)) {
             abort_with_perror(LINUX_PERF_"sched_getaffinity failed:");
         }
     }
@@ -593,14 +690,14 @@ struct PerfRawConfig {
             const std::string& value = items[1];
             if (key == "dump") {
                 // limit the number of dumps per thread
-                dump = strtoll(value.c_str(), nullptr, 0);
+                dump_limit = strtoll(value.c_str(), nullptr, 0);
             } else if (key == "cpus") {
                 // thread affinity can be changed by runtime libs; allow explicit cpu list.
                 parse_cpu_list(value);
             } else {
-                auto config = parse_raw_event_config(value);
+                auto config = parse_pmu_event_hex(value);
                 if (config > 0) {
-                    raw_configs.emplace_back(key, config);
+                    custom_pmu_events.emplace_back(key, config);
                 }
             }
             return;
@@ -608,29 +705,29 @@ struct PerfRawConfig {
 
         if (items.size() == 1) {
             if (items[0] == "switch-cpu") {
-                enable_switch_cpu_mode();
+                enable_context_switch_tracking();
             }
             if (items[0] == "dump") {
-                dump = std::numeric_limits<int64_t>::max(); // no limit to number of dumps
+                dump_limit = std::numeric_limits<int64_t>::max(); // no limit to number of dumps
             }
         }
     }
 
-    void print_config() const {
-        for (auto& cfg : raw_configs) {
+    void log_parsed_config() const {
+        for (auto& cfg : custom_pmu_events) {
             log_printf(LINUX_PERF_" config: %s=0x%lx\n", cfg.first.c_str(), cfg.second);
         }
-        if (switch_cpu) {
+        if (context_switch_enabled) {
             log_printf(LINUX_PERF_" config: switch_cpu\n");
         }
-        if (dump) {
-            log_printf(LINUX_PERF_" config: dump=%ld\n", dump);
+        if (dump_limit) {
+            log_printf(LINUX_PERF_" config: dump=%ld\n", dump_limit);
         }
-        if (CPU_COUNT(&cpu_mask)) {
+        if (CPU_COUNT(&cpu_affinity_mask)) {
             std::ostringstream ss;
             ss << LINUX_PERF_ << " config: cpus=";
             for (int cpu = 0; cpu < (int)sizeof(cpu_set_t) * 8; cpu++) {
-                if (CPU_ISSET(cpu, &cpu_mask)) {
+                if (CPU_ISSET(cpu, &cpu_affinity_mask)) {
                     ss << cpu << ",";
                 }
             }
@@ -639,8 +736,8 @@ struct PerfRawConfig {
         }
     }
 
-    PerfRawConfig() {
-        CPU_ZERO(&cpu_mask);
+    PerfConfig() {
+        CPU_ZERO(&cpu_affinity_mask);
         // env var defined raw events
         const char* str_raw_config = std::getenv("LINUX_PERF");
         if (!str_raw_config) {
@@ -653,44 +750,51 @@ struct PerfRawConfig {
         for (auto& opt : options) {
             parse_option(opt);
         }
-        print_config();
+        log_parsed_config();
     }
 
-    bool dump_on_cpu(int cpu) {
-        if (dump == 0) {
+    bool should_dump_on_cpu(int cpu) {
+        if (dump_limit == 0) {
             return false;
         }
-        if (CPU_COUNT(&cpu_mask)) {
-            return CPU_ISSET(cpu, &cpu_mask);
+        if (CPU_COUNT(&cpu_affinity_mask)) {
+            return CPU_ISSET(cpu, &cpu_affinity_mask);
         }
         return true;
     }
 
-    static PerfRawConfig& get() {
-        static PerfRawConfig inst;
+    static PerfConfig& get() {
+        static PerfConfig inst;
         return inst;
     }
 };
 
+// ============================================================================
+// Section: Per-CPU Context Switch Timeline
+// Tracks CPU-wide context switches to build a timeline showing which thread
+// was running on which CPU at any point.  Uses PERF_RECORD_SWITCH_CPU_WIDE
+// records delivered via a memory-mapped ring buffer (one per monitored CPU).
+// The resulting time slices appear in the JSON output as duration events on
+// virtual "CPU<N>" threads, enabling visual correlation with per-thread scopes.
+// ============================================================================
 
-// context switch events
-// this will visualize 
-struct PerfEventContextSwitch : public IPerfEventDumper {
-    bool is_enabled;
+struct CpuContextSwitchTracker : public ITraceEventDumper {
+    bool tracking_enabled;
 
-    struct CpuEvent {
+    // State for one monitored CPU's perf event fd and ring buffer.
+    struct PerCpuState {
         int fd;
         perf_event_mmap_page * pmeta;
         int cpu;
-        uint64_t ctx_switch_in_time;
-        uint64_t ctx_switch_in_tid;
-        uint64_t ctx_last_time;
+        uint64_t switch_in_timestamp;       // when the current TID switched in
+        uint64_t switch_in_tid;             // which TID switched in
+        uint64_t last_event_timestamp;      // timestamp of the last processed record
 
-        CpuEvent(int fd, perf_event_mmap_page * pmeta): fd(fd), pmeta(pmeta) {}
+        PerCpuState(int fd, perf_event_mmap_page * pmeta): fd(fd), pmeta(pmeta) {}
     };
-    std::vector<CpuEvent> events;
+    std::vector<PerCpuState> per_cpu_states;
 
-    static perf_event_attr make_ctx_switch_perf_attr() {
+    static perf_event_attr build_context_switch_attr() {
         perf_event_attr pea = make_perf_event_attr(PERF_TYPE_HARDWARE,
                                                    PERF_COUNT_HW_REF_CPU_CYCLES,
                                                    true,
@@ -707,28 +811,28 @@ struct PerfEventContextSwitch : public IPerfEventDumper {
         return pea;
     }
 
-    static size_t context_switch_mmap_length() {
+    static size_t ring_buffer_mmap_size() {
         return sysconf(_SC_PAGESIZE) * (1024 + 1);
     }
 
-    void add_cpu_event(int cpu) {
-        perf_event_attr pea = make_ctx_switch_perf_attr();
-        const size_t mmap_length = context_switch_mmap_length();
+    void open_cpu_monitor(int cpu) {
+        perf_event_attr pea = build_context_switch_attr();
+        const size_t mmap_length = ring_buffer_mmap_size();
 
-        // measures all processes/threads on the specified CPU
+        // measures all processes/threads on the specified CPU (pid=-1 = CPU-wide)
         const int ctx_switch_fd = perf_event_open(&pea, -1, cpu, -1, 0);
         if (ctx_switch_fd < 0) {
-            abort_with_perror(LINUX_PERF_"PerfEventContextSwitch perf_event_open failed (check /proc/sys/kernel/perf_event_paranoid please)");
+            abort_with_perror(LINUX_PERF_"CpuContextSwitchTracker perf_event_open failed (check /proc/sys/kernel/perf_event_paranoid please)");
         }
 
         auto* ctx_switch_pmeta = map_perf_event_metadata_or_abort(
                 ctx_switch_fd, mmap_length, LINUX_PERF_"mmap perf_event_mmap_page failed:");
 
         log_printf(LINUX_PERF_"perf_event_open CPU_WIDE context_switch on cpu %d, ctx_switch_fd=%d\n", cpu, ctx_switch_fd);
-        events.emplace_back(ctx_switch_fd, ctx_switch_pmeta);
-        events.back().ctx_switch_in_time = get_time_ns();
-        events.back().ctx_last_time = get_time_ns();
-        events.back().cpu = cpu;
+        per_cpu_states.emplace_back(ctx_switch_fd, ctx_switch_pmeta);
+        per_cpu_states.back().switch_in_timestamp = get_time_ns();
+        per_cpu_states.back().last_event_timestamp = get_time_ns();
+        per_cpu_states.back().cpu = cpu;
     }
 
     bool should_enable(const cpu_set_t& mask) {
@@ -736,38 +840,43 @@ struct PerfEventContextSwitch : public IPerfEventDumper {
         log_printf(LINUX_PERF_"sizeof(cpu_set_t):%lu: _SC_NPROCESSORS_ONLN=%ld CPU_COUNT=%d\n",
                    sizeof(cpu_set_t), number_of_processors, CPU_COUNT(&mask));
         if (CPU_COUNT(&mask) >= number_of_processors) {
-            log_printf(LINUX_PERF_" no affinity is set, will not enable PerfEventContextSwitch\n");
+            log_printf(LINUX_PERF_" no affinity is set, will not enable CpuContextSwitchTracker\n");
             return false;
         }
         return true;
     }
 
-    void open_events_for_mask(const cpu_set_t& mask) {
+    void open_monitors_for_cpus(const cpu_set_t& mask) {
         for (int cpu = 0; cpu < (int)sizeof(cpu_set_t) * 8; cpu++) {
             if (!CPU_ISSET(cpu, &mask)) {
                 continue;
             }
-            add_cpu_event(cpu);
+            open_cpu_monitor(cpu);
         }
     }
 
-    void append_active_context_switches() {
-        for (auto& ev : events) {
-            if (ev.ctx_switch_in_time == 0) {
+    // Flush any currently-running (switch-in but no switch-out yet) slices
+    // by using "now" as a temporary end point.  Called at dump time to avoid
+    // losing the final in-progress slice.
+    void flush_active_slices() {
+        for (auto& ev : per_cpu_states) {
+            if (ev.switch_in_timestamp == 0) {
                 continue;
             }
-            all_dump_data.emplace_back();
-            auto* pd = &all_dump_data.back();
-            pd->tid = ev.ctx_switch_in_tid;
+            recorded_slices.emplace_back();
+            auto* pd = &recorded_slices.back();
+            pd->tid = ev.switch_in_tid;
             pd->cpu = ev.cpu;
-            pd->tsc_start = ev.ctx_switch_in_time;
+            pd->tsc_start = ev.switch_in_timestamp;
             pd->tsc_end = get_time_ns();
-            ev.ctx_switch_in_time = 0;
+            ev.switch_in_timestamp = 0;
         }
     }
 
-    bool needs_ring_buffer_update() const {
-        for (auto& ev : events) {
+    // Check whether any ring buffer is more than half full.
+    // Only drain when this returns true, to reduce profiling overhead.
+    bool is_ring_buffer_half_full() const {
+        for (auto& ev : per_cpu_states) {
             const auto& mmap_meta = *ev.pmeta;
             const auto used_size = (mmap_meta.data_head - mmap_meta.data_tail) % mmap_meta.data_size;
             if (used_size > (mmap_meta.data_size >> 1)) {
@@ -777,56 +886,63 @@ struct PerfEventContextSwitch : public IPerfEventDumper {
         return false;
     }
 
-    void dump_ring_buffer_constants() const {
+    void log_record_type_constants() const {
         log_printf("PERF_RECORD_SWITCH = %d\n", PERF_RECORD_SWITCH);
         log_printf("PERF_RECORD_SWITCH_CPU_WIDE = %d\n", PERF_RECORD_SWITCH_CPU_WIDE);
         log_printf("PERF_RECORD_MISC_SWITCH_OUT = %d\n", PERF_RECORD_MISC_SWITCH_OUT);
         log_printf("PERF_RECORD_MISC_SWITCH_OUT_PREEMPT  = %d\n", PERF_RECORD_MISC_SWITCH_OUT_PREEMPT);
     }
 
-    void append_switch_out_event(CpuEvent& ev, uint32_t tid, uint32_t cpu, uint64_t time, __u16 misc) {
-        all_dump_data.emplace_back();
-        auto* pd = &all_dump_data.back();
+    // Record a completed time slice: [switch_in_timestamp, switch_out_time].
+    void record_switch_out(PerCpuState& ev, uint32_t tid, uint32_t cpu, uint64_t time, __u16 misc) {
+        recorded_slices.emplace_back();
+        auto* pd = &recorded_slices.back();
         pd->tid = tid;
         pd->cpu = cpu;
         pd->preempt = (misc & PERF_RECORD_MISC_SWITCH_OUT_PREEMPT);
-        pd->tsc_start = ev.ctx_switch_in_time;
+        pd->tsc_start = ev.switch_in_timestamp;
         pd->tsc_end = time;
 
-        if (ring_buffer_verbose) {
-            log_printf("\t  cpu: %u tid: %u  %lu (+%lu)\n", cpu, tid, ev.ctx_switch_in_time, time - ev.ctx_switch_in_time);
+        if (verbose_logging) {
+            log_printf("\t  cpu: %u tid: %u  %lu (+%lu)\n", cpu, tid, ev.switch_in_timestamp, time - ev.switch_in_timestamp);
         }
-        ev.ctx_switch_in_time = 0;
+        ev.switch_in_timestamp = 0;
     }
 
-    void process_ring_buffer_record(CpuEvent& ev, perf_event_mmap_page& mmap_meta, uint64_t& head0, uint64_t head1) {
+    // Parse one record from the ring buffer and update the switch-in/out state machine.
+    void parse_one_record(PerCpuState& ev, perf_event_mmap_page& mmap_meta, uint64_t& head0, uint64_t head1) {
         const auto h0 = head0;
-        RingBufferCursor cursor(mmap_meta, head0);
+        RingBufferReader cursor(mmap_meta, head0);
         const ContextSwitchRecord record = ContextSwitchRecord::parse(cursor);
         (void)record.reserved0;
         (void)record.next_prev_pid;
         (void)record.pid;
 
-        if (record.tid > 0 && ring_buffer_verbose) {
+        if (record.tid > 0 && verbose_logging) {
             log_printf("event: %lu/%lu\ttype,misc,size=(%u,%u,%u) cpu%u,next_prev_tid=%u,tid=%u  time:(%lu), (+%lu)\n",
                        h0, head1, record.type, record.misc, record.size, record.cpu,
-                       record.next_prev_tid, record.tid, record.time, record.time - ev.ctx_last_time);
+                       record.next_prev_tid, record.tid, record.time, record.time - ev.last_event_timestamp);
         }
 
+        // State machine:
+        //   switch-in  → save timestamp and tid
+        //   switch-out → form [start, end] time slice
         if (record.type == PERF_RECORD_SWITCH_CPU_WIDE && record.tid > 0) {
             if (record.misc & PERF_RECORD_MISC_SWITCH_OUT || record.misc & PERF_RECORD_MISC_SWITCH_OUT_PREEMPT) {
-                append_switch_out_event(ev, record.tid, record.cpu, record.time, record.misc);
+                record_switch_out(ev, record.tid, record.cpu, record.time, record.misc);
             } else {
-                ev.ctx_switch_in_time = record.time;
-                ev.ctx_switch_in_tid = record.tid;
+                ev.switch_in_timestamp = record.time;
+                ev.switch_in_tid = record.tid;
             }
         }
 
-        ev.ctx_last_time = record.time;
+        ev.last_event_timestamp = record.time;
         head0 = h0 + record.size;
     }
 
-    void process_ring_buffer(CpuEvent& ev) {
+    // Consume all available records from one CPU's ring buffer.
+    // After draining, advances data_tail so the kernel can reuse the space.
+    void drain_ring_buffer(PerCpuState& ev) {
         auto& mmap_meta = *ev.pmeta;
         uint64_t head0 = mmap_meta.data_tail;
         const uint64_t head1 = mmap_meta.data_head;
@@ -834,12 +950,12 @@ struct PerfEventContextSwitch : public IPerfEventDumper {
         if (head0 == head1) {
             return;
         }
-        if (ring_buffer_verbose) {
-            dump_ring_buffer_constants();
+        if (verbose_logging) {
+            log_record_type_constants();
         }
 
         while (head0 < head1) {
-            process_ring_buffer_record(ev, mmap_meta, head0, head1);
+            parse_one_record(ev, mmap_meta, head0, head1);
         }
 
         if (head0 != head1) {
@@ -852,33 +968,34 @@ struct PerfEventContextSwitch : public IPerfEventDumper {
         std::atomic_thread_fence(std::memory_order_seq_cst);
     }
 
-    PerfEventContextSwitch() {
-        is_enabled = PerfRawConfig::get().switch_cpu;
-        if (is_enabled) {
-            // make sure TSC in PerfEventJsonDumper is the very first thing to initialize
-            PerfEventJsonDumper::get().register_manager(this);
+    CpuContextSwitchTracker() {
+        tracking_enabled = PerfConfig::get().context_switch_enabled;
+        if (tracking_enabled) {
+            // make sure TimestampConverter in TraceFileWriter is the very first thing to initialize
+            TraceFileWriter::get().register_dumper(this);
 
             // open fd for each CPU
-            const cpu_set_t mask = PerfRawConfig::get().cpu_mask;
+            const cpu_set_t mask = PerfConfig::get().cpu_affinity_mask;
             if (!should_enable(mask)) {
-                is_enabled = false;
+                tracking_enabled = false;
                 return;
             }
 
-            open_events_for_mask(mask);
+            open_monitors_for_cpus(mask);
             my_pid = getpid();
             my_tid = gettid();
         }
     }
 
-    ~PerfEventContextSwitch() {
-        if (is_enabled) {
-            PerfEventJsonDumper::get().finalize();
+    ~CpuContextSwitchTracker() {
+        if (tracking_enabled) {
+            TraceFileWriter::get().flush_and_close();
         }
-        release_perf_event_resources(events, context_switch_mmap_length());
+        release_perf_event_resources(per_cpu_states, ring_buffer_mmap_size());
     }
 
-    struct ProfileData {
+    // A time slice where a particular TID was running on a particular CPU.
+    struct TimeSlice {
         uint64_t tsc_start;
         uint64_t tsc_end;
         uint32_t tid;
@@ -886,30 +1003,29 @@ struct PerfEventContextSwitch : public IPerfEventDumper {
         bool preempt;   // preempt means current TID preempts previous thread
     };
 
-    std::deque<ProfileData> all_dump_data;
+    std::deque<TimeSlice> recorded_slices;
 
-    void dump_json(std::ofstream& fw, TscCounter& tsc) override {
-        if (!is_enabled) {
+    void dump_json(std::ofstream& fw, TimestampConverter& tsc) override {
+        if (!tracking_enabled) {
             return;
         }
 
-        updateRingBuffer();
+        drain_all_ring_buffers();
 
-        auto data_size = all_dump_data.size();
+        auto data_size = recorded_slices.size();
         if (!data_size) {
             return;
         }
 
-        append_active_context_switches();
+        flush_active_slices();
 
         auto pid = 9999;    // fake pid for CPU
         auto cat = "TID";
-        
+
         // TID is used for CPU id instead
-        for (auto& d : all_dump_data) {
-            auto duration = tsc.tsc_to_usec(d.tsc_start, d.tsc_end);
-            auto start = tsc.tsc_to_usec(d.tsc_start);
-            //auto end = tsc.tsc_to_usec(d.tsc_end);
+        for (auto& d : recorded_slices) {
+            auto duration = tsc.duration_usec(d.tsc_start, d.tsc_end);
+            auto start = tsc.ticks_to_usec(d.tsc_start);
             auto cpu_id = d.cpu;
 
             fw << "{\"ph\": \"X\", \"name\": \"" << d.tid << "\", \"cat\":\"" << cat << "\","
@@ -918,69 +1034,82 @@ struct PerfEventContextSwitch : public IPerfEventDumper {
         }
     }
 
-    bool ring_buffer_verbose = false;
+    bool verbose_logging = false;
     uint32_t my_pid = 0;
     uint32_t my_tid = 0;
-    std::atomic<int> atom_guard{0};
+    std::atomic<int> update_lock{0};
 
-    void updateRingBuffer() {
+    // Drain all per-CPU ring buffers.  Only one thread may do this at a time
+    // (guarded by atomic try-lock); others simply skip if the lock is held.
+    void drain_all_ring_buffers() {
         // only one thread can update ring-buffer at one time
-        AtomicSpinGuard lock_guard(atom_guard);
+        AtomicTryLockGuard lock_guard(update_lock);
         if (!lock_guard.owns_lock()) {
             return;
         }
 
-        if (!needs_ring_buffer_update()) {
+        if (!is_ring_buffer_half_full()) {
             return;
         }
 
-        for (auto& ev : events) {
-            process_ring_buffer(ev);
+        for (auto& ev : per_cpu_states) {
+            drain_ring_buffer(ev);
         }
     }
 
-    static PerfEventContextSwitch& get() {
-        static PerfEventContextSwitch inst;
+    static CpuContextSwitchTracker& get() {
+        static CpuContextSwitchTracker inst;
         return inst;
     }
 };
 
-struct PerfEventGroup : public IPerfEventDumper {
+// ============================================================================
+// Section: Per-Thread Hardware/Software Counter Group
+//
+// PerfCounterGroup is the core profiling class.  It manages a perf_event
+// group for the current thread and provides:
+//   - Adding HW/SW/RAW counters to the group
+//   - Unified enable/disable/reset
+//   - Two counter read paths: fast (rdpmc userspace) and slow (read() syscall)
+//   - begin_scope() / ProfileScope RAII for scoped measurements
+//   - JSON trace output via ITraceEventDumper
+//
+// One instance per thread (thread_local in get()).
+// ============================================================================
+
+struct PerfCounterGroup : public ITraceEventDumper {
     static constexpr size_t kReadBufferU64Count = 512;
 
-    int group_fd = -1;
+    int leader_fd = -1;                 // fd of the group leader event
     uint64_t read_format;
 
-    struct CounterEvent {
+    // Describes a single counter within the group.
+    struct CounterDescriptor {
         int fd = -1;
         uint64_t id = 0;
-        uint64_t pmc_index = 0;
+        uint64_t pmc_index = 0;        // >0 if rdpmc fast path is available
         perf_event_mmap_page* pmeta = nullptr;
         std::string name = "?";
         char format[32];
     };
-    std::vector<CounterEvent> events;
+    std::vector<CounterDescriptor> counter_descriptors;
 
-    uint64_t read_buf[kReadBufferU64Count]; // 4KB
-    uint64_t time_enabled;
-    uint64_t time_running;
-    uint64_t pmc_width;
-    uint64_t pmc_mask;
+    uint64_t read_buffer[kReadBufferU64Count]; // 4KB
+    uint64_t pmc_bit_width;
+    uint64_t pmc_value_mask;            // bitmask applied to rdpmc result
     uint64_t values[32];
     uint32_t tsc_time_shift;
     uint32_t tsc_time_mult;
 
-    // ref_cpu_cycles even id
-    // this event is fixed function counter provided by most x86 CPU
-    // and it provides TSC clock which is:
-    //    - very high-resolution (<1ns or >1GHz)
-    //    - independent of CPU-frequency throttling
-    int ref_cpu_cycles_evid = -1;
-    int sw_task_clock_evid = -1;
-    int hw_cpu_cycles_evid = -1;
-    int hw_instructions_evid = -1;
+    // Well-known event indices (into counter_descriptors vector).
+    // -1 means the event is not present in this group.
+    int task_clock_index = -1;
+    int cpu_cycles_index = -1;
+    int instructions_index = -1;
 
-    struct ProfileData {
+    // A snapshot of counter values for one profiled scope.
+    // Contains start/end timestamps, counter deltas, and optional extra data.
+    struct ScopedSnapshot {
         uint64_t tsc_start;
         uint64_t tsc_end;
         std::string title;
@@ -988,22 +1117,9 @@ struct PerfEventGroup : public IPerfEventDumper {
         int32_t id;
         static const int data_size = 16; // 4(fixed) + 8(PMU) + 4(software)
         uint64_t data[data_size] = {0};
-        ExtraDataStorage<data_size> extra_data;
+        TypeErasedArgStorage<data_size> extra_data;
 
-        template<typename T>
-        void set_extra_data(int& i, T* t) { extra_data.set_data(i, t); }
-        void set_extra_data(int& i, float t) { extra_data.set_data(i, t); }
-        void set_extra_data(int& i, double t) { extra_data.set_data(i, t); }
-        template<typename T>
-        void set_extra_data(int& i, T t) { extra_data.set_data(i, t); }
-        template<typename T>
-        void set_extra_data(int& i, const std::vector<T>& t) { extra_data.set_data(i, t); }
-        void set_extra_data(int i) { extra_data.set_terminator(i); }
-
-        template <typename ... Values>
-        void set_extra_datas(Values... vals) { extra_data.set_datas(vals...); }
-
-        ProfileData(std::string title, std::string cat = {})
+        ScopedSnapshot(std::string title, std::string cat = {})
             : title(std::move(title)), cat(std::move(cat)) {
             start();
         }
@@ -1015,172 +1131,179 @@ struct PerfEventGroup : public IPerfEventDumper {
         }
     };
 
-    bool enable_dump_json = false;
-    int64_t dump_limit = 0;
-    std::deque<ProfileData> all_dump_data;
-    int serial;
+    bool json_dump_enabled = false;
+    int64_t remaining_dump_quota = 0;
+    std::deque<ScopedSnapshot> recorded_snapshots;
+    int dumper_serial_id;
 
-    using EventArgsSerializer = std::function<void(std::ostream& fw, double usec, uint64_t* counters)>;
-    EventArgsSerializer event_args_serializer;
+    using CustomArgsSerializer = std::function<void(std::ostream& fw, double usec, uint64_t* counters)>;
+    CustomArgsSerializer custom_args_serializer;
 
-    void append_serializer_args(std::stringstream& ss, double duration, const ProfileData& d) const {
-        if (event_args_serializer) {
-            event_args_serializer(ss, duration, const_cast<uint64_t*>(d.data));
+    // --- JSON serialization helpers ---
+
+    void emit_custom_args(std::stringstream& ss, double duration, const ScopedSnapshot& d) const {
+        if (custom_args_serializer) {
+            custom_args_serializer(ss, duration, const_cast<uint64_t*>(d.data));
         }
     }
 
-    void append_derived_metrics(std::stringstream& ss, double duration, const ProfileData& d) const {
-        if (sw_task_clock_evid >= 0) {
+    // Emit derived metrics: CPU usage, frequency, CPI.
+    void emit_derived_metrics(std::stringstream& ss, double duration, const ScopedSnapshot& d) const {
+        if (task_clock_index >= 0) {
             // PERF_COUNT_SW_TASK_CLOCK is in nano-seconds.
-            ss << "\"CPU Usage\":" << (d.data[sw_task_clock_evid] * 1e-3) / duration << ",";
+            ss << "\"CPU Usage\":" << (d.data[task_clock_index] * 1e-3) / duration << ",";
         }
-        if (hw_cpu_cycles_evid >= 0) {
-            if (sw_task_clock_evid >= 0 && d.data[sw_task_clock_evid] > 0) {
-                ss << "\"CPU Freq(GHz)\":" << static_cast<double>(d.data[hw_cpu_cycles_evid]) / d.data[sw_task_clock_evid] << ",";
+        if (cpu_cycles_index >= 0) {
+            if (task_clock_index >= 0 && d.data[task_clock_index] > 0) {
+                ss << "\"CPU Freq(GHz)\":" << static_cast<double>(d.data[cpu_cycles_index]) / d.data[task_clock_index] << ",";
             } else {
-                ss << "\"CPU Freq(GHz)\":" << static_cast<double>(d.data[hw_cpu_cycles_evid]) * 1e-3 / duration << ",";
+                ss << "\"CPU Freq(GHz)\":" << static_cast<double>(d.data[cpu_cycles_index]) * 1e-3 / duration << ",";
             }
-            if (hw_instructions_evid >= 0 && d.data[hw_instructions_evid] > 0) {
-                ss << "\"CPI\":" << static_cast<double>(d.data[hw_cpu_cycles_evid]) / d.data[hw_instructions_evid] << ",";
+            if (instructions_index >= 0 && d.data[instructions_index] > 0) {
+                ss << "\"CPI\":" << static_cast<double>(d.data[cpu_cycles_index]) / d.data[instructions_index] << ",";
             }
         }
     }
 
-    void append_counter_values(std::stringstream& ss, const ProfileData& d) const {
+    void emit_counter_values(std::stringstream& ss, const ScopedSnapshot& d) const {
         const std::locale prev_locale = ss.imbue(std::locale(""));
         const char * sep = "";
-        for (size_t i = 0; i < events.size() && i < d.data_size; i++) {
-            ss << sep << "\"" << events[i].name << "\":\"" << d.data[i] << "\"";
+        for (size_t i = 0; i < counter_descriptors.size() && i < d.data_size; i++) {
+            ss << sep << "\"" << counter_descriptors[i].name << "\":\"" << d.data[i] << "\"";
             sep = ",";
         }
         ss.imbue(prev_locale);
     }
 
-    void append_extra_data(std::stringstream& ss, const ProfileData& d) const {
+    void emit_extra_data(std::stringstream& ss, const ScopedSnapshot& d) const {
         d.extra_data.append_json(ss);
     }
 
-    std::string build_args_json(double duration, const ProfileData& d) const {
+    std::string serialize_args_json(double duration, const ScopedSnapshot& d) const {
         std::stringstream ss;
-        append_serializer_args(ss, duration, d);
-        append_derived_metrics(ss, duration, d);
-        append_counter_values(ss, d);
-        append_extra_data(ss, d);
+        emit_custom_args(ss, duration, d);
+        emit_derived_metrics(ss, duration, d);
+        emit_counter_values(ss, d);
+        emit_extra_data(ss, d);
         return ss.str();
     }
 
-    void write_event_prefix(std::ofstream& fw, const ProfileData& d, TscCounter& tsc, double start, double duration) const {
+    void write_trace_event_header(std::ofstream& fw, const ScopedSnapshot& d, TimestampConverter& tsc, double start, double duration) const {
         if (d.id < 0) {
-            fw << "{\"ph\": \"b\", \"name\": \"" << d.title << "\", \"cat\":\"" << d.cat << "\"," 
+            // Async (flow) event: begin/end pair linked by id
+            fw << "{\"ph\": \"b\", \"name\": \"" << d.title << "\", \"cat\":\"" << d.cat << "\","
                << "\"pid\": " << my_pid << ", \"id\": " << (-d.id) << ","
                << "\"ts\": " << std::setprecision(15) << start << "},";
 
-            fw << "{\"ph\": \"e\", \"name\": \"" << d.title << "\", \"cat\":\"" << d.cat << "\"," 
+            fw << "{\"ph\": \"e\", \"name\": \"" << d.title << "\", \"cat\":\"" << d.cat << "\","
                << "\"pid\": " << my_pid << ", \"id\": " << (-d.id) << ","
-               << "\"ts\": " << std::setprecision(15) << tsc.tsc_to_usec(d.tsc_end) << ",";
+               << "\"ts\": " << std::setprecision(15) << tsc.ticks_to_usec(d.tsc_end) << ",";
             return;
         }
 
-        fw << "{\"ph\": \"X\", \"name\": \"" << d.title << "_" << d.id << "\", \"cat\":\"" << d.cat << "\"," 
+        // Complete duration event
+        fw << "{\"ph\": \"X\", \"name\": \"" << d.title << "_" << d.id << "\", \"cat\":\"" << d.cat << "\","
            << "\"pid\": " << my_pid << ", \"tid\": " << my_tid << ","
            << "\"ts\": " << std::setprecision(15) << start << ", \"dur\": " << duration << ",";
     }
 
-    void write_event_json(std::ofstream& fw, const ProfileData& d, TscCounter& tsc) const {
-        const double duration = tsc.tsc_to_usec(d.tsc_start, d.tsc_end);
-        const double start = tsc.tsc_to_usec(d.tsc_start);
-        write_event_prefix(fw, d, tsc, start, duration);
-        fw << "\"args\":{" << build_args_json(duration, d) << "}},\n";
+    void write_trace_event(std::ofstream& fw, const ScopedSnapshot& d, TimestampConverter& tsc) const {
+        const double duration = tsc.duration_usec(d.tsc_start, d.tsc_end);
+        const double start = tsc.ticks_to_usec(d.tsc_start);
+        write_trace_event_header(fw, d, tsc, start, duration);
+        fw << "\"args\":{" << serialize_args_json(duration, d) << "}},\n";
     }
 
-    void dump_json(std::ofstream& fw, TscCounter& tsc) override {
-        if (!enable_dump_json) {
+    void dump_json(std::ofstream& fw, TimestampConverter& tsc) override {
+        if (!json_dump_enabled) {
             return;
         }
-        auto data_size = all_dump_data.size();
+        auto data_size = recorded_snapshots.size();
         if (!data_size) {
             return;
         }
 
-        for (auto& d : all_dump_data) {
-            write_event_json(fw, d, tsc);
+        for (auto& d : recorded_snapshots) {
+            write_trace_event(fw, d, tsc);
         }
-        all_dump_data.clear();
-        std::cout << LINUX_PERF_"#" << serial << "(" << this << ") finalize: dumped " << data_size << std::endl;
+        recorded_snapshots.clear();
+        std::cout << LINUX_PERF_"#" << dumper_serial_id << "(" << this << ") finalize: dumped " << data_size << std::endl;
     }
 
     uint64_t operator[](size_t i) {
-        if (i < events.size()) {
+        if (i < counter_descriptors.size()) {
             return values[i];
         } else {
-            log_printf(LINUX_PERF_"PerfEventGroup: operator[] with index %lu oveflow (>%lu)\n", i, events.size());
+            log_printf(LINUX_PERF_"PerfCounterGroup: operator[] with index %lu oveflow (>%lu)\n", i, counter_descriptors.size());
             abort();
         }
-        return 0;
-    }
-    
-    PerfEventGroup() = default;
-
-    size_t captured_event_count() const {
-        return std::min(events.size(), static_cast<size_t>(ProfileData::data_size));
     }
 
-    bool can_use_rdpmc_fast_path() const {
-        return num_events_no_pmc == 0;
+    PerfCounterGroup() = default;
+
+    size_t active_counter_count() const {
+        return std::min(counter_descriptors.size(), static_cast<size_t>(ScopedSnapshot::data_size));
     }
 
-    void snapshot_profile_start(ProfileData& profile_data) {
-        const size_t num_counters = captured_event_count();
-        if (can_use_rdpmc_fast_path()) {
+    // Returns true if all counters can be read via rdpmc (zero syscall overhead).
+    bool can_use_rdpmc() const {
+        return non_rdpmc_event_count == 0;
+    }
+
+    // Capture counter values at scope start (either via rdpmc or read syscall).
+    void capture_start_counters(ScopedSnapshot& snapshot) {
+        const size_t num_counters = active_counter_count();
+        if (can_use_rdpmc()) {
             for (size_t i = 0; i < num_counters; i++) {
-                if (events[i].pmc_index) {
-                    profile_data.data[i] = read_pmc(events[i].pmc_index - 1);
+                if (counter_descriptors[i].pmc_index) {
+                    snapshot.data[i] = read_pmc(counter_descriptors[i].pmc_index - 1);
                 }
             }
             return;
         }
 
-        read_group_values();
+        read_all_counters();
         for (size_t i = 0; i < num_counters; i++) {
-            profile_data.data[i] = values[i];
+            snapshot.data[i] = values[i];
         }
     }
 
-    uint64_t* snapshot_profile_finish(ProfileData& profile_data, std::map<std::string, uint64_t>* ext_data = nullptr) {
-        const size_t num_counters = captured_event_count();
+    // Capture counter values at scope end, compute deltas, optionally export to a map.
+    uint64_t* capture_end_counters(ScopedSnapshot& snapshot, std::map<std::string, uint64_t>* ext_data = nullptr) {
+        const size_t num_counters = active_counter_count();
 
-        profile_data.stop();
-        if (can_use_rdpmc_fast_path()) {
+        snapshot.stop();
+        if (can_use_rdpmc()) {
             for (size_t i = 0; i < num_counters; i++) {
-                if (events[i].pmc_index) {
-                    profile_data.data[i] = (read_pmc(events[i].pmc_index - 1) - profile_data.data[i]) & pmc_mask;
+                if (counter_descriptors[i].pmc_index) {
+                    snapshot.data[i] = (read_pmc(counter_descriptors[i].pmc_index - 1) - snapshot.data[i]) & pmc_value_mask;
                 } else {
-                    profile_data.data[i] = 0;
+                    snapshot.data[i] = 0;
                 }
             }
         } else {
-            read_group_values();
+            read_all_counters();
             for (size_t i = 0; i < num_counters; i++) {
-                profile_data.data[i] = values[i] - profile_data.data[i];
+                snapshot.data[i] = values[i] - snapshot.data[i];
             }
         }
 
         if (ext_data) {
-            (*ext_data)["ns"] = profile_data.tsc_end - profile_data.tsc_start;
+            (*ext_data)["ns"] = snapshot.tsc_end - snapshot.tsc_start;
             for (size_t i = 0; i < num_counters; i++) {
-                (*ext_data)[events[i].name] = profile_data.data[i];
+                (*ext_data)[counter_descriptors[i].name] = snapshot.data[i];
             }
         }
 
-        return profile_data.data;
+        return snapshot.data;
     }
 
     void initialize_dump_state() {
-        dump_limit = PerfRawConfig::get().dump;
-        enable_dump_json = PerfRawConfig::get().dump_on_cpu(sched_getcpu());
-        serial = 0;
-        if (enable_dump_json) {
-            serial = PerfEventJsonDumper::get().register_manager(this);
+        remaining_dump_quota = PerfConfig::get().dump_limit;
+        json_dump_enabled = PerfConfig::get().should_dump_on_cpu(sched_getcpu());
+        dumper_serial_id = 0;
+        if (json_dump_enabled) {
+            dumper_serial_id = TraceFileWriter::get().register_dumper(this);
         }
     }
 
@@ -1189,11 +1312,12 @@ struct PerfEventGroup : public IPerfEventDumper {
         my_tid = gettid();
     }
 
-    struct Config {
-        Config(std::string str) {
+    // Specifies which perf event to open: type (HW/SW/RAW), config code, and display name.
+    struct EventSpec {
+        EventSpec(std::string str) {
             parse_from_string(str);
         }
-        Config(uint32_t type, uint64_t config, const char * name = "?") : type(type), config(config), name(name) {}
+        EventSpec(uint32_t type, uint64_t config, const char * name = "?") : type(type), config(config), name(name) {}
 
         static bool try_parse_named_config(const std::string& str, uint32_t& type, uint64_t& config) {
             if (str == "HW_CPU_CYCLES" || str == "cycles") {
@@ -1214,24 +1338,6 @@ struct PerfEventGroup : public IPerfEventDumper {
             return false;
         }
 
-        static uint64_t parse_raw_config_values(const std::vector<std::string>& values, const std::string& str) {
-            if (values.size() == 1) {
-                return std::strtoull(values[0].c_str(), nullptr, 0);
-            }
-            if (values.size() == 2) {
-                return X86_RAW_EVENT(
-                        std::strtoull(values[0].c_str(), nullptr, 0),
-                        std::strtoull(values[1].c_str(), nullptr, 0), 0);
-            }
-            if (values.size() == 3) {
-                return X86_RAW_EVENT(
-                        std::strtoull(values[0].c_str(), nullptr, 0),
-                        std::strtoull(values[1].c_str(), nullptr, 0),
-                        std::strtoull(values[2].c_str(), nullptr, 0));
-            }
-            throw std::runtime_error(std::string("Unknown Perf config (too many values): ") + str);
-        }
-
         void parse_raw_config(const std::string& str) {
             type = PERF_TYPE_RAW;
             auto items = str_split(str, "=");
@@ -1239,8 +1345,7 @@ struct PerfEventGroup : public IPerfEventDumper {
                 throw std::runtime_error(std::string("Unknown Perf config: ") + str);
             }
             name = items[0];
-            auto values = str_split(items[1], ",");
-            config = parse_raw_config_values(values, str);
+            config = parse_raw_event_values(str_split(items[1], ","));
         }
 
         void parse_from_string(const std::string& str) {
@@ -1254,29 +1359,29 @@ struct PerfEventGroup : public IPerfEventDumper {
         std::string name;
     };
 
-    void add_configured_event(const Config& config) {
+    void open_configured_counter(const EventSpec& config) {
         if (config.type == PERF_TYPE_SOFTWARE) {
-            add_sw(config.config);
+            open_software_counter(config.config);
         } else if (config.type == PERF_TYPE_HARDWARE) {
-            add_hw(config.config);
+            open_hardware_counter(config.config);
         } else if (config.type == PERF_TYPE_RAW) {
-            add_raw(config.config);
+            open_raw_counter(config.config);
         }
-        events.back().name = config.name;
-        snprintf(events.back().format, sizeof(events.back().format), "%%%lulu, ", config.name.size());
+        counter_descriptors.back().name = config.name;
+        snprintf(counter_descriptors.back().format, sizeof(counter_descriptors.back().format), "%%%lulu, ", config.name.size());
     }
 
     uint32_t my_pid = 0;
     uint32_t my_tid = 0;
 
-    PerfEventGroup(const std::vector<Config> type_configs, EventArgsSerializer fn = {}) : event_args_serializer(fn) {
+    PerfCounterGroup(const std::vector<EventSpec> type_configs, CustomArgsSerializer fn = {}) : custom_args_serializer(fn) {
         for(auto& tc : type_configs) {
-            add_configured_event(tc);
+            open_configured_counter(tc);
         }
 
         // env var defined raw events
-        for (auto raw_cfg : PerfRawConfig::get().raw_configs) {
-            add_configured_event({PERF_TYPE_RAW, raw_cfg.second, raw_cfg.first.c_str()});
+        for (auto raw_cfg : PerfConfig::get().custom_pmu_events) {
+            open_configured_counter({PERF_TYPE_RAW, raw_cfg.second, raw_cfg.first.c_str()});
         }
 
         initialize_dump_state();
@@ -1285,26 +1390,17 @@ struct PerfEventGroup : public IPerfEventDumper {
         enable();
     }
 
-    ~PerfEventGroup() {
-        if (enable_dump_json) {
-            PerfEventJsonDumper::get().finalize();
+    ~PerfCounterGroup() {
+        if (json_dump_enabled) {
+            TraceFileWriter::get().flush_and_close();
         }
         disable();
-        release_perf_event_resources(events, sysconf(_SC_PAGESIZE));
+        release_perf_event_resources(counter_descriptors, sysconf(_SC_PAGESIZE));
     }
 
-    void show_header() {
-        std::ostringstream ss;
-        ss << "\e[33m";
-        ss << "#" << serial << ":";
-        for(auto& ev : events) {
-            ss << ev.name << ", ";
-        }
-        ss << "\e[0m\n";
-        log_message(ss.str());
-    }
-
-    void update_pmc_metadata(CounterEvent& ev) {
+    // Refresh the rdpmc index from the mmap metadata page.
+    // Uses the kernel seqlock protocol to ensure a consistent read.
+    void refresh_rdpmc_index(CounterDescriptor& ev) {
         if (ev.pmc_index != 0 || !ev.pmeta->cap_user_rdpmc) {
             return;
         }
@@ -1314,9 +1410,9 @@ struct PerfEventGroup : public IPerfEventDumper {
             seqlock = ev.pmeta->lock;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             ev.pmc_index = ev.pmeta->index;
-            pmc_width = ev.pmeta->pmc_width;
-            pmc_mask = 1;
-            pmc_mask = (pmc_mask << pmc_width) - 1;
+            pmc_bit_width = ev.pmeta->pmc_width;
+            pmc_value_mask = 1;
+            pmc_value_mask = (pmc_value_mask << pmc_bit_width) - 1;
             if (ev.pmeta->cap_user_time) {
                 tsc_time_shift = ev.pmeta->time_shift;
                 tsc_time_mult = ev.pmeta->time_mult;
@@ -1325,62 +1421,60 @@ struct PerfEventGroup : public IPerfEventDumper {
         } while (ev.pmeta->lock != seqlock || (seqlock & 1));
     }
 
-    void reset_and_enable_group() {
-        ioctl(group_fd, PERF_EVENT_IOC_RESET, PERF_IOC_FLAG_GROUP);
-        ioctl(group_fd, PERF_EVENT_IOC_ENABLE, PERF_IOC_FLAG_GROUP);
+    void reset_and_enable() {
+        ioctl(leader_fd, PERF_EVENT_IOC_RESET, PERF_IOC_FLAG_GROUP);
+        ioctl(leader_fd, PERF_EVENT_IOC_ENABLE, PERF_IOC_FLAG_GROUP);
     }
 
     void initialize_rdpmc_state() {
         // PMC index is only valid when being enabled.
-        num_events_no_pmc = 0;
-        for (auto& ev : events) {
-            update_pmc_metadata(ev);
+        non_rdpmc_event_count = 0;
+        for (auto& ev : counter_descriptors) {
+            refresh_rdpmc_index(ev);
             if (ev.pmc_index == 0) {
-                num_events_no_pmc ++;
+                non_rdpmc_event_count ++;
             }
         }
     }
 
-    void add_raw(uint64_t config, bool pinned=false) {
-        // pinned only applies to hardware events and group leaders; keep behavior unchanged.
+    void open_raw_counter(uint64_t config, bool pinned=false) {
         perf_event_attr pea = make_perf_event_attr(PERF_TYPE_RAW,
                                                    config,
                                                    true,
-                                                   group_fd == -1,
-                                                   pinned && group_fd == -1);
-        add(&pea);
+                                                   leader_fd == -1,
+                                                   pinned && leader_fd == -1);
+        open_counter(&pea);
     }
 
-    void add_hw(uint64_t config, bool pinned=false) {
+    void open_hardware_counter(uint64_t config, bool pinned=false) {
         perf_event_attr pea = make_perf_event_attr(PERF_TYPE_HARDWARE,
                                                    config,
                                                    true,
-                                                   group_fd == -1,
-                                                   pinned && group_fd == -1);
-        add(&pea);
+                                                   leader_fd == -1,
+                                                   pinned && leader_fd == -1);
+        open_counter(&pea);
     }
 
-    void add_sw(uint64_t config) {
+    void open_software_counter(uint64_t config) {
         // some SW events are counted in kernel, so keep exclude_kernel=false.
         perf_event_attr pea = make_perf_event_attr(PERF_TYPE_SOFTWARE,
                                                    config,
                                                    false,
                                                    false,
                                                    false);
-        add(&pea);
+        open_counter(&pea);
     }
 
-    void prepare_event_attr(perf_event_attr* pev_attr) {
-        // clockid must be consistent within group.
+    // Set clock source to CLOCK_MONOTONIC_RAW for consistency within the group.
+    void set_clock_source(perf_event_attr* pev_attr) {
         pev_attr->use_clockid = 1;
-        // synchronize with clock_gettime(CLOCK_MONOTONIC_RAW)
         pev_attr->clockid = CLOCK_MONOTONIC_RAW;
     }
 
-    int open_event_fd(perf_event_attr* pev_attr, pid_t pid, int cpu) {
+    int open_perf_fd(perf_event_attr* pev_attr, pid_t pid, int cpu) {
         bool has_retried_with_exclude_kernel = false;
         while (true) {
-            const int fd = perf_event_open(pev_attr, pid, cpu, group_fd, 0);
+            const int fd = perf_event_open(pev_attr, pid, cpu, leader_fd, 0);
             if (fd >= 0) {
                 return fd;
             }
@@ -1396,63 +1490,64 @@ struct PerfEventGroup : public IPerfEventDumper {
         }
     }
 
-    perf_event_mmap_page* map_event_metadata(int fd, size_t mmap_length) {
+    perf_event_mmap_page* mmap_event_page(int fd, size_t mmap_length) {
         return map_perf_event_metadata_or_abort(fd, mmap_length, LINUX_PERF_"mmap perf_event_mmap_page failed:");
     }
 
-    void update_group_leader(CounterEvent& ev, const perf_event_attr* pev_attr) {
-        if (group_fd == -1) {
-            group_fd = ev.fd;
+    // The first event opened becomes the group leader.
+    void promote_to_group_leader(CounterDescriptor& ev, const perf_event_attr* pev_attr) {
+        if (leader_fd == -1) {
+            leader_fd = ev.fd;
             read_format = pev_attr->read_format;
         }
     }
 
-    void register_event_indices(const perf_event_attr* pev_attr, size_t event_index) {
-        if (pev_attr->type == PERF_TYPE_HARDWARE && pev_attr->config == PERF_COUNT_HW_REF_CPU_CYCLES) {
-            ref_cpu_cycles_evid = event_index;
-        }
+    // Track indices of well-known events (cycles, instructions, task_clock, ref_cycles)
+    // so we can compute derived metrics (CPU frequency, CPI, CPU usage).
+    void record_well_known_indices(const perf_event_attr* pev_attr, size_t event_index) {
         if (pev_attr->type == PERF_TYPE_SOFTWARE && pev_attr->config == PERF_COUNT_SW_TASK_CLOCK) {
-            sw_task_clock_evid = event_index;
+            task_clock_index = event_index;
         }
         if (pev_attr->type == PERF_TYPE_HARDWARE && pev_attr->config == PERF_COUNT_HW_CPU_CYCLES) {
-            hw_cpu_cycles_evid = event_index;
+            cpu_cycles_index = event_index;
         }
         if (pev_attr->type == PERF_TYPE_HARDWARE && pev_attr->config == PERF_COUNT_HW_INSTRUCTIONS) {
-            hw_instructions_evid = event_index;
+            instructions_index = event_index;
         }
     }
 
-    void finalize_added_event(CounterEvent& ev, const perf_event_attr* pev_attr) {
-        update_group_leader(ev, pev_attr);
-        register_event_indices(pev_attr, events.size());
-        events.push_back(ev);
+    void commit_counter(CounterDescriptor& ev, const perf_event_attr* pev_attr) {
+        promote_to_group_leader(ev, pev_attr);
+        record_well_known_indices(pev_attr, counter_descriptors.size());
+        counter_descriptors.push_back(ev);
     }
 
-    void add(perf_event_attr* pev_attr, pid_t pid = 0, int cpu = -1) {
-        CounterEvent ev;
+    // Open a perf event fd, mmap its metadata page, and add it to the group.
+    void open_counter(perf_event_attr* pev_attr, pid_t pid = 0, int cpu = -1) {
+        CounterDescriptor ev;
 
         const size_t mmap_length = sysconf(_SC_PAGESIZE) * 1;
-        prepare_event_attr(pev_attr);
+        set_clock_source(pev_attr);
 
-        ev.fd = open_event_fd(pev_attr, pid, cpu);
+        ev.fd = open_perf_fd(pev_attr, pid, cpu);
         ioctl(ev.fd, PERF_EVENT_IOC_ID, &ev.id);
-        ev.pmeta = map_event_metadata(ev.fd, mmap_length);
-        finalize_added_event(ev, pev_attr);
+        ev.pmeta = mmap_event_page(ev.fd, mmap_length);
+        commit_counter(ev, pev_attr);
     }
 
-    bool event_group_enabled = false;
-    uint32_t num_events_no_pmc;
+    bool counters_active = false;
+    uint32_t non_rdpmc_event_count;     // count of events that cannot use rdpmc fast path
 
     void enable() {
-        if (event_group_enabled) {
+        if (counters_active) {
             return;
         }
-        reset_and_enable_group();
+        reset_and_enable();
         initialize_rdpmc_state();
-        event_group_enabled = true;
+        counters_active = true;
     }
 
-    uint64_t tsc2nano(uint64_t cyc) {
+    uint64_t tsc_ticks_to_nanoseconds(uint64_t cyc) {
         uint64_t quot, rem;
         quot  = cyc >> tsc_time_shift;
         rem   = cyc & (((uint64_t)1 << tsc_time_shift) - 1);
@@ -1460,57 +1555,35 @@ struct PerfEventGroup : public IPerfEventDumper {
     }
 
     void disable() {
-        if (!event_group_enabled) {
+        if (!counters_active) {
             return;
         }
 
-        ioctl(group_fd, PERF_EVENT_IOC_DISABLE, PERF_IOC_FLAG_GROUP);
+        ioctl(leader_fd, PERF_EVENT_IOC_DISABLE, PERF_IOC_FLAG_GROUP);
 
-        for(auto& ev : events) {
+        for(auto& ev : counter_descriptors) {
             ev.pmc_index = 0;
         }
-        event_group_enabled = false;
+        counters_active = false;
     }
 
+    // Measure a lambda: read counters before and after, return counter deltas.
+    // Optionally prints a formatted summary line if `name` is non-empty.
+    // Measure a lambda: read counters before and after, return counter deltas.
+    // Optionally prints a formatted summary line if `name` is non-empty.
     template<class FN>
-    std::vector<uint64_t> rdpmc(FN fn, std::string name = {}, int64_t loop_cnt = 0, std::function<void(uint64_t, uint64_t*, char*&)> addinfo = {}) {
-        int cnt = events.size();
-        std::vector<uint64_t> pmc(cnt, 0);
-
-        bool use_pmc = (num_events_no_pmc == 0);
-        if (use_pmc) {
-            for(int i = 0; i < cnt; i++) {
-                if (events[i].pmc_index) {
-                    pmc[i] = read_pmc(events[i].pmc_index - 1);
-                } else {
-                    pmc[i] = 0;
-                }
-            }
-        } else {
-            read_group_values();
-            for(int i = 0; i < cnt; i++) {
-                pmc[i] = values[i];
-            }
-        }
+    std::vector<uint64_t> measure(FN fn, std::string name = {}, int64_t loop_cnt = 0, std::function<void(uint64_t, uint64_t*, char*&)> addinfo = {}) {
+        ScopedSnapshot snap("measure");
+        capture_start_counters(snap);
 
         auto tsc0 = read_tsc();
         fn();
         auto tsc1 = read_tsc();
 
-        if (use_pmc) {
-            for(int i = 0; i < cnt; i++) {
-                if (events[i].pmc_index) {
-                    pmc[i] = (read_pmc(events[i].pmc_index - 1) - pmc[i]) & pmc_mask;
-                } else {
-                    pmc[i] = 0;
-                }
-            }
-        } else {
-            read_group_values();
-            for(int i = 0; i < cnt; i++) {
-                pmc[i] -= values[i];
-            }
-        }
+        capture_end_counters(snap);
+
+        const size_t cnt = active_counter_count();
+        std::vector<uint64_t> pmc(snap.data, snap.data + cnt);
 
         if (!name.empty()) {
             char log_buff[1024];
@@ -1529,19 +1602,19 @@ struct PerfEventGroup : public IPerfEventDumper {
                 }
             };
             safe_snprintf("\e[33m");
-            for(int i = 0; i < cnt; i++) {
-                safe_snprintf(events[i].format, pmc[i]);
+            for(size_t i = 0; i < cnt; i++) {
+                safe_snprintf(counter_descriptors[i].format, pmc[i]);
             }
-            auto duration_ns = tsc2nano(tsc1 - tsc0);
-            
+            auto duration_ns = tsc_ticks_to_nanoseconds(tsc1 - tsc0);
+
             safe_snprintf("\e[0m [%16s] %.3f us", name.c_str(), duration_ns/1e3);
-            if (hw_cpu_cycles_evid >= 0) {
-                safe_snprintf(" CPU:%.2f(GHz)", 1.0 * pmc[hw_cpu_cycles_evid] / duration_ns);
-                if (hw_instructions_evid >= 0) {
-                    safe_snprintf(" CPI:%.2f", 1.0 * pmc[hw_cpu_cycles_evid] / pmc[hw_instructions_evid]);
+            if (cpu_cycles_index >= 0) {
+                safe_snprintf(" CPU:%.2f(GHz)", 1.0 * pmc[cpu_cycles_index] / duration_ns);
+                if (instructions_index >= 0) {
+                    safe_snprintf(" CPI:%.2f", 1.0 * pmc[cpu_cycles_index] / pmc[instructions_index]);
                 }
                 if (loop_cnt > 0) {
-                    safe_snprintf(" CPK:%.1fx%ld", 1.0 * pmc[hw_cpu_cycles_evid] / loop_cnt, loop_cnt);
+                    safe_snprintf(" CPK:%.1fx%ld", 1.0 * pmc[cpu_cycles_index] / loop_cnt, loop_cnt);
                 }
             }
             if (addinfo) {
@@ -1553,59 +1626,62 @@ struct PerfEventGroup : public IPerfEventDumper {
         return pmc;
     }
 
-    void read_group_values(bool verbose = false) {
-        for(size_t i = 0; i < events.size(); i++) values[i] = 0;
+    // Read all counter values from the group leader fd via read() syscall.
+    // The kernel returns (nr, [time_enabled], [time_running], {value, id}*nr).
+    // We match each {value, id} pair back to its counter descriptor by id.
+    void read_all_counters(bool verbose = false) {
+        for(size_t i = 0; i < counter_descriptors.size(); i++) values[i] = 0;
 
-        if (::read(group_fd, read_buf, sizeof(read_buf)) == -1) {
+        if (::read(leader_fd, read_buffer, sizeof(read_buffer)) == -1) {
             abort_with_perror(LINUX_PERF_"read perf event failed:");
         }
 
-        uint64_t * readv = read_buf;
+        uint64_t * readv = read_buffer;
         auto nr = *readv++;
         if (verbose) {
             log_printf("number of counters:\t%lu\n", nr);
         }
-        time_enabled = 0;
-        time_running = 0;
         if (read_format & PERF_FORMAT_TOTAL_TIME_ENABLED) {
-            time_enabled = *readv++;
-            if (verbose) {
-                log_printf("time_enabled:\t%lu\n", time_enabled);
-            }
+            auto val = *readv++;
+            if (verbose) { log_printf("time_enabled:\t%lu\n", val); }
         }
         if (read_format & PERF_FORMAT_TOTAL_TIME_RUNNING) {
-            time_running = *readv++;
-            if (verbose) {
-                log_printf("time_running:\t%lu\n", time_running);
-            }
+            auto val = *readv++;
+            if (verbose) { log_printf("time_running:\t%lu\n", val); }
         }
 
         for (size_t i = 0; i < nr; i++) {
             auto value = *readv++;
             auto id = *readv++;
-            for (size_t k = 0; k < events.size(); k++) {
-                if (id == events[k].id) {
+            for (size_t k = 0; k < counter_descriptors.size(); k++) {
+                if (id == counter_descriptors[k].id) {
                     values[k] = value;
                 }
             }
         }
 
         if (verbose) {
-            for (size_t k = 0; k < events.size(); k++) {
+            for (size_t k = 0; k < counter_descriptors.size(); k++) {
                 log_printf("\t[%lu]: %lu\n", k, values[k]);
             }
         }
     }
 
     //================================================================================
-    // profiler API with json_dump capability
+    // Profiler API with json_dump capability
+    //================================================================================
+
+    // RAII guard for a profiled scope.  Construction captures start counters;
+    // destruction (or explicit finish()) captures end counters and computes deltas.
+    // Move-only to prevent double-finish.  The optional sampling lock prevents
+    // nested Profile() calls from recording, reducing overhead in hot paths.
     struct ProfileScope {
-        PerfEventGroup* pevg = nullptr;
-        ProfileData* pd = nullptr;
+        PerfCounterGroup* pevg = nullptr;
+        ScopedSnapshot* pd = nullptr;
         bool do_unlock = false;
         size_t num_events = 0;
         ProfileScope() = default;
-        ProfileScope(PerfEventGroup* pevg, ProfileData* pd, bool do_unlock = false) : pevg(pevg), pd(pd), do_unlock(do_unlock) {}
+        ProfileScope(PerfCounterGroup* pevg, ScopedSnapshot* pd, bool do_unlock = false) : pevg(pevg), pd(pd), do_unlock(do_unlock) {}
 
         // Move only
         ProfileScope(const ProfileScope&) = delete;
@@ -1642,15 +1718,15 @@ struct PerfEventGroup : public IPerfEventDumper {
 
         uint64_t* finish(std::map<std::string, uint64_t>* ext_data = nullptr) {
             if (do_unlock) {
-                PerfEventGroup::get_sampling_lock() --;
+                PerfCounterGroup::sampling_lock() --;
             }
             num_events = 0;
             if (!pevg || !pd) {
                 return nullptr;
             }
 
-            num_events = pevg->captured_event_count();
-            uint64_t* result = pevg->snapshot_profile_finish(*pd, ext_data);
+            num_events = pevg->active_counter_count();
+            uint64_t* result = pevg->capture_end_counters(*pd, ext_data);
 
             pevg = nullptr;
             return result;
@@ -1661,28 +1737,28 @@ struct PerfEventGroup : public IPerfEventDumper {
         }
     };
 
-    ProfileData* begin_profile(const std::string& title, int id = 0, const std::string& cat = "") {
-        if (get_sampling_lock().load() != 0) {
+    ScopedSnapshot* begin_scope(const std::string& title, int id = 0, const std::string& cat = "") {
+        if (sampling_lock().load() != 0) {
             return nullptr;
         }
-        if (dump_limit == 0) {
+        if (remaining_dump_quota == 0) {
             return nullptr;
         }
-        dump_limit --;
+        remaining_dump_quota --;
 
-        PerfEventContextSwitch::get().updateRingBuffer();
+        CpuContextSwitchTracker::get().drain_all_ring_buffers();
 
-        all_dump_data.emplace_back(title, cat);
-        auto* pd = &all_dump_data.back();
+        recorded_snapshots.emplace_back(title, cat);
+        auto* pd = &recorded_snapshots.back();
         pd->id = id;
 
-        snapshot_profile_start(*pd);
+        capture_start_counters(*pd);
 
         return pd;
     }
 
-    static PerfEventGroup& get() {
-        thread_local PerfEventGroup pevg({
+    static PerfCounterGroup& get() {
+        thread_local PerfCounterGroup pevg({
             {PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES, "HW_CPU_CYCLES"},
             {PERF_TYPE_HARDWARE, PERF_COUNT_HW_INSTRUCTIONS, "HW_INSTRUCTIONS"},
             {PERF_TYPE_HARDWARE, PERF_COUNT_HW_CACHE_MISSES, "HW_CACHE_MISSES"},
@@ -1694,22 +1770,35 @@ struct PerfEventGroup : public IPerfEventDumper {
         return pevg;
     }
 
-    // this lock is global, affect all threads
-    static std::atomic_int& get_sampling_lock() {
-        static std::atomic_int sampling_lock{0};
-        return sampling_lock;
+    // Global atomic lock that affects all threads.
+    // When non-zero, begin_scope() returns nullptr (skips profiling).
+    // Used by sampling probability to suppress nested measurements.
+    static std::atomic_int& sampling_lock() {
+        static std::atomic_int lock{0};
+        return lock;
     }
 };
 
-using ProfileScope = PerfEventGroup::ProfileScope;
+using ProfileScope = PerfCounterGroup::ProfileScope;
 
-inline bool should_disable_profile(float sampling_probability) {
+// ============================================================================
+// Section: Public API
+//
+// Profile(title, ...)       -- returns a ProfileScope RAII guard that captures
+//                              counters for the current scope.
+// Profile(probability, ...) -- same, but randomly skips (1-p) fraction of scopes
+//                              to reduce overhead in high-frequency paths.
+// Init()                    -- call once from main thread to start context-switch
+//                              tracking and register the main thread.
+// ============================================================================
+
+inline bool should_skip_sample(float sampling_probability) {
     return (std::rand() % 1000) * 0.001f >= sampling_probability;
 }
 
-inline void lock_sampling_if_needed(bool disable_profile) {
+inline void suppress_nested_sampling(bool disable_profile) {
     if (disable_profile) {
-        PerfEventGroup::get_sampling_lock() ++;
+        PerfCounterGroup::sampling_lock() ++;
     }
 }
 
@@ -1721,16 +1810,16 @@ ProfileScope make_profile_scope(const std::string& title,
                                 float sampling_probability,
                                 int id,
                                 Args&&... args) {
-    auto& pevg = PerfEventGroup::get();
-    auto* pd = category ? pevg.begin_profile(title, id, *category) : pevg.begin_profile(title, id);
+    auto& pevg = PerfCounterGroup::get();
+    auto* pd = category ? pevg.begin_scope(title, id, *category) : pevg.begin_scope(title, id);
     if (pd) {
-        pd->set_extra_datas(std::forward<Args>(args)...);
+        pd->extra_data.set_datas(std::forward<Args>(args)...);
     }
 
     bool disable_profile = false;
     if (use_sampling_probability) {
-        disable_profile = should_disable_profile(sampling_probability);
-        lock_sampling_if_needed(disable_profile);
+        disable_profile = should_skip_sample(sampling_probability);
+        suppress_nested_sampling(disable_profile);
     }
     return ProfileScope(&pevg, pd, disable_profile);
 }
@@ -1747,7 +1836,7 @@ ProfileScope Profile(const std::string& title, const std::string& category, int 
     return make_profile_scope(title, &category, false, 0.0f, id, std::forward<Args>(args)...);
 }
 
-// overload accept sampling_probability, which can be used to disable profile in scope 
+// overload accept sampling_probability, which can be used to disable profile in scope
 template <typename ... Args>
 ProfileScope Profile(float sampling_probability, const std::string& title, int id = 0, Args&&... args) {
     return make_profile_scope(title, nullptr, true, sampling_probability, id, std::forward<Args>(args)...);
@@ -1760,7 +1849,7 @@ ProfileScope Profile(float sampling_probability, const std::string& title, const
 
 inline int Init() {
     // this is for capture all context switching events
-    PerfEventContextSwitch::get();
+    CpuContextSwitchTracker::get();
 
     // this is for making main threads the first process
     auto dummy = Profile("start");
@@ -1769,33 +1858,37 @@ inline int Init() {
 
 } // namespace LinuxPerf
 
+// ============================================================================
+// Section: C API Bridge
+// extern "C" functions for calling from plain C code.  Wraps the C++
+// ProfileScope in an opaque void* handle.
+// ============================================================================
 
 #ifdef LINUX_PERF_C_API
-#include <cstdarg>
-inline void fill_profile_data_from_va_list(LinuxPerf::PerfEventGroup::ProfileData* pd, int count, va_list ap) {
+inline void fill_extra_data_from_va_list(LinuxPerf::PerfCounterGroup::ScopedSnapshot* pd, int count, va_list ap) {
     if (!pd) {
         return;
     }
     for (int j = 0; j < count; j++) {
-        pd->set_extra_data(j, va_arg(ap, int));
+        pd->extra_data.set_data(j, va_arg(ap, int));
     }
-    pd->set_extra_data(count);
+    pd->extra_data.set_terminator(count);
 }
 
-inline void* start_c_api_profile(const char * title,
+inline void* begin_c_api_scope(const char * title,
                                  const char * category,
                                  float sampling_probability,
                                  bool use_sampling_probability,
                                  int count,
                                  va_list ap) {
-    auto& pevg = LinuxPerf::PerfEventGroup::get();
-    auto* pd = pevg.begin_profile(title, 0, category);
-    fill_profile_data_from_va_list(pd, count, ap);
+    auto& pevg = LinuxPerf::PerfCounterGroup::get();
+    auto* pd = pevg.begin_scope(title, 0, category);
+    fill_extra_data_from_va_list(pd, count, ap);
 
     bool disable_profile = false;
     if (use_sampling_probability) {
-        disable_profile = LinuxPerf::should_disable_profile(sampling_probability);
-        LinuxPerf::lock_sampling_if_needed(disable_profile);
+        disable_profile = LinuxPerf::should_skip_sample(sampling_probability);
+        LinuxPerf::suppress_nested_sampling(disable_profile);
     }
     return reinterpret_cast<void*>(new LinuxPerf::ProfileScope{&pevg, pd, disable_profile});
 }
@@ -1803,14 +1896,14 @@ inline void* start_c_api_profile(const char * title,
 extern "C" void* linux_perf_profile_start(const char * title, const char * category, int count, ...) {
     va_list ap;
     va_start(ap, count);
-    void* profile = start_c_api_profile(title, category, 0.0f, false, count, ap);
+    void* profile = begin_c_api_scope(title, category, 0.0f, false, count, ap);
     va_end(ap);
     return profile;
 }
 extern "C" void* linux_perf_profile_start_prob(const char * title, const char * category, float sampling_probability, int count, ...) {
     va_list ap;
     va_start(ap, count);
-    void* profile = start_c_api_profile(title, category, sampling_probability, true, count, ap);
+    void* profile = begin_c_api_scope(title, category, sampling_probability, true, count, ap);
     va_end(ap);
     return profile;
 }
@@ -1825,4 +1918,3 @@ extern void* linux_perf_profile_start(const char * title, const char * category,
 extern void* linux_perf_profile_start_prob(const char * title, const char * category, float sampling_probability, int count, ...);
 extern void linux_perf_profile_end(void* p);
 #endif ///#ifdef __cplusplus
-
