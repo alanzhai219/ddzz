@@ -41,7 +41,7 @@ void print_selected_counters(const std::map<std::string, uint64_t>& counters) {
 }  // namespace
 
 int main() {
-    LinuxPerf::Init();
+    // LinuxPerf::Init();
 
     const size_t element_count = 1 << 18;
     const int rounds = 32;

@@ -85,28 +85,24 @@ namespace LinuxPerf {
 
 // Two-level stringize: #x stringizes literally without macro expansion,
 // so STRINGIFY(EXPAND(__LINE__)) is needed to get "42" instead of "__LINE__".
-#define STRINGIFY_LITERAL(x) #x
-#define STRINGIFY_EXPAND(x) STRINGIFY_LITERAL(x)
+#define LINUX_PERF_STRINGIFY_LITERAL(x) #x
+#define LINUX_PERF_STRINGIFY_EXPAND(x) LINUX_PERF_STRINGIFY_LITERAL(x)
 
-#define LINUX_PERF_ "\e[33m[LINUX_PERF:" STRINGIFY_EXPAND(__LINE__) "]\e[0m "
+#define LINUX_PERF_PREFIX() "\x1b[33m[LINUX_PERF:" LINUX_PERF_STRINGIFY_EXPAND(__LINE__) "]\x1b[0m "
 
-inline void log_printf(const char* format, ...) {
+inline void log_info(const char* format, ...) {
     va_list args;
     va_start(args, format);
     vprintf(format, args);
     va_end(args);
 }
 
-inline void log_message(const std::string& message) {
-    std::cout << message;
-}
-
-inline void log_perror(const char* message) {
+inline void log_error(const char* message) {
     perror(message);
 }
 
-inline void abort_with_perror(const char* message) {
-    log_perror(message);
+inline void log_abort(const char* message) {
+    log_error(message);
     abort();
 }
 
@@ -119,7 +115,7 @@ inline void abort_with_perror(const char* message) {
 inline uint64_t get_time_ns() {
     struct timespec tp0;
     if (clock_gettime(CLOCK_MONOTONIC_RAW, &tp0) != 0) {
-        abort_with_perror(LINUX_PERF_"clock_gettime(CLOCK_MONOTONIC_RAW,...) failed!");
+        log_abort(LINUX_PERF_PREFIX() "clock_gettime(CLOCK_MONOTONIC_RAW,...) failed!");
     }
     return (tp0.tv_sec * 1000000000) + tp0.tv_nsec;
 }
@@ -259,7 +255,7 @@ struct TraceFileWriter {
         output_stream.close();
         needs_finalization = false;
 
-        std::cout << LINUX_PERF_"Dumped ";
+        std::cout << LINUX_PERF_PREFIX() << "Dumped ";
 
         if (total_size < 1024) {
             std::cout << total_size << " bytes ";
@@ -275,8 +271,8 @@ struct TraceFileWriter {
         std::lock_guard<std::mutex> guard(writer_mutex);
         std::ostringstream ss;
         auto serial_id = registered_dumper_count.fetch_add(1);
-        ss << LINUX_PERF_"#" << serial_id << "(" << pthis << ") : is registered." << std::endl;
-        log_message(ss.str());
+        ss << LINUX_PERF_PREFIX() << "#" << serial_id << "(" << pthis << ") : is registered." << std::endl;
+        log_info(ss.str().c_str());
         registered_dumpers.emplace(pthis);
         return serial_id;
     }
@@ -313,7 +309,7 @@ struct TraceFileWriter {
         CrossLibrarySingleton() {
             int fd = shm_open(shm_name, O_CREAT | O_RDWR, 0600);
             if (ftruncate(fd, 4096) != 0) {
-                abort_with_perror("ftruncate failed!");
+                log_abort("ftruncate failed!");
             }
             pid_t pid = getpid();
             shared_block = reinterpret_cast<SharedMemoryBlock*>(mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
@@ -462,7 +458,7 @@ inline perf_event_mmap_page* map_perf_event_metadata_or_abort(int fd, size_t mma
             mmap(NULL, mmap_length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
     if (pmeta == MAP_FAILED) {
         close(fd);
-        abort_with_perror(error_message);
+        log_abort(error_message);
     }
     return pmeta;
 }
@@ -679,7 +675,7 @@ struct PerfConfig {
         context_switch_enabled = true;
         CPU_ZERO(&cpu_affinity_mask);
         if (sched_getaffinity(getpid(), sizeof(cpu_set_t), &cpu_affinity_mask)) {
-            abort_with_perror(LINUX_PERF_"sched_getaffinity failed:");
+            log_abort(LINUX_PERF_PREFIX() "sched_getaffinity failed:");
         }
     }
 
@@ -715,24 +711,24 @@ struct PerfConfig {
 
     void log_parsed_config() const {
         for (auto& cfg : custom_pmu_events) {
-            log_printf(LINUX_PERF_" config: %s=0x%lx\n", cfg.first.c_str(), cfg.second);
+            log_info(LINUX_PERF_PREFIX() " config: %s=0x%lx\n", cfg.first.c_str(), cfg.second);
         }
         if (context_switch_enabled) {
-            log_printf(LINUX_PERF_" config: switch_cpu\n");
+            log_info(LINUX_PERF_PREFIX() " config: switch_cpu\n");
         }
         if (dump_limit) {
-            log_printf(LINUX_PERF_" config: dump=%ld\n", dump_limit);
+            log_info(LINUX_PERF_PREFIX() " config: dump=%ld\n", dump_limit);
         }
         if (CPU_COUNT(&cpu_affinity_mask)) {
             std::ostringstream ss;
-            ss << LINUX_PERF_ << " config: cpus=";
+            ss << LINUX_PERF_PREFIX() << " config: cpus=";
             for (int cpu = 0; cpu < (int)sizeof(cpu_set_t) * 8; cpu++) {
                 if (CPU_ISSET(cpu, &cpu_affinity_mask)) {
                     ss << cpu << ",";
                 }
             }
             ss << std::endl;
-            log_message(ss.str());
+            log_info(ss.str().c_str());
         }
     }
 
@@ -741,7 +737,7 @@ struct PerfConfig {
         // env var defined raw events
         const char* str_raw_config = std::getenv("LINUX_PERF");
         if (!str_raw_config) {
-            log_printf(LINUX_PERF_" LINUX_PERF is unset, example: LINUX_PERF=dump:switch-cpu:L2_MISS=0x10d1\n");
+            log_info(LINUX_PERF_PREFIX() " LINUX_PERF is unset, example: export LINUX_PERF=dump:switch-cpu:L2_MISS=0x10d1\n");
             return;
         }
 
@@ -822,13 +818,13 @@ struct CpuContextSwitchTracker : public ITraceEventDumper {
         // measures all processes/threads on the specified CPU (pid=-1 = CPU-wide)
         const int ctx_switch_fd = perf_event_open(&pea, -1, cpu, -1, 0);
         if (ctx_switch_fd < 0) {
-            abort_with_perror(LINUX_PERF_"CpuContextSwitchTracker perf_event_open failed (check /proc/sys/kernel/perf_event_paranoid please)");
+            log_abort(LINUX_PERF_PREFIX() "CpuContextSwitchTracker perf_event_open failed (check /proc/sys/kernel/perf_event_paranoid please)");
         }
 
         auto* ctx_switch_pmeta = map_perf_event_metadata_or_abort(
-                ctx_switch_fd, mmap_length, LINUX_PERF_"mmap perf_event_mmap_page failed:");
+                ctx_switch_fd, mmap_length, LINUX_PERF_PREFIX() "mmap perf_event_mmap_page failed:");
 
-        log_printf(LINUX_PERF_"perf_event_open CPU_WIDE context_switch on cpu %d, ctx_switch_fd=%d\n", cpu, ctx_switch_fd);
+        log_info(LINUX_PERF_PREFIX() "perf_event_open CPU_WIDE context_switch on cpu %d, ctx_switch_fd=%d\n", cpu, ctx_switch_fd);
         per_cpu_states.emplace_back(ctx_switch_fd, ctx_switch_pmeta);
         per_cpu_states.back().switch_in_timestamp = get_time_ns();
         per_cpu_states.back().last_event_timestamp = get_time_ns();
@@ -837,10 +833,10 @@ struct CpuContextSwitchTracker : public ITraceEventDumper {
 
     bool should_enable(const cpu_set_t& mask) {
         const long number_of_processors = sysconf(_SC_NPROCESSORS_ONLN);
-        log_printf(LINUX_PERF_"sizeof(cpu_set_t):%lu: _SC_NPROCESSORS_ONLN=%ld CPU_COUNT=%d\n",
+        log_info(LINUX_PERF_PREFIX() "sizeof(cpu_set_t):%lu: _SC_NPROCESSORS_ONLN=%ld CPU_COUNT=%d\n",
                    sizeof(cpu_set_t), number_of_processors, CPU_COUNT(&mask));
         if (CPU_COUNT(&mask) >= number_of_processors) {
-            log_printf(LINUX_PERF_" no affinity is set, will not enable CpuContextSwitchTracker\n");
+            log_info(LINUX_PERF_PREFIX() " no affinity is set, will not enable CpuContextSwitchTracker\n");
             return false;
         }
         return true;
@@ -887,10 +883,10 @@ struct CpuContextSwitchTracker : public ITraceEventDumper {
     }
 
     void log_record_type_constants() const {
-        log_printf("PERF_RECORD_SWITCH = %d\n", PERF_RECORD_SWITCH);
-        log_printf("PERF_RECORD_SWITCH_CPU_WIDE = %d\n", PERF_RECORD_SWITCH_CPU_WIDE);
-        log_printf("PERF_RECORD_MISC_SWITCH_OUT = %d\n", PERF_RECORD_MISC_SWITCH_OUT);
-        log_printf("PERF_RECORD_MISC_SWITCH_OUT_PREEMPT  = %d\n", PERF_RECORD_MISC_SWITCH_OUT_PREEMPT);
+        log_info("PERF_RECORD_SWITCH = %d\n", PERF_RECORD_SWITCH);
+        log_info("PERF_RECORD_SWITCH_CPU_WIDE = %d\n", PERF_RECORD_SWITCH_CPU_WIDE);
+        log_info("PERF_RECORD_MISC_SWITCH_OUT = %d\n", PERF_RECORD_MISC_SWITCH_OUT);
+        log_info("PERF_RECORD_MISC_SWITCH_OUT_PREEMPT  = %d\n", PERF_RECORD_MISC_SWITCH_OUT_PREEMPT);
     }
 
     // Record a completed time slice: [switch_in_timestamp, switch_out_time].
@@ -904,7 +900,7 @@ struct CpuContextSwitchTracker : public ITraceEventDumper {
         pd->tsc_end = time;
 
         if (verbose_logging) {
-            log_printf("\t  cpu: %u tid: %u  %lu (+%lu)\n", cpu, tid, ev.switch_in_timestamp, time - ev.switch_in_timestamp);
+            log_info("\t  cpu: %u tid: %u  %lu (+%lu)\n", cpu, tid, ev.switch_in_timestamp, time - ev.switch_in_timestamp);
         }
         ev.switch_in_timestamp = 0;
     }
@@ -919,7 +915,7 @@ struct CpuContextSwitchTracker : public ITraceEventDumper {
         (void)record.pid;
 
         if (record.tid > 0 && verbose_logging) {
-            log_printf("event: %lu/%lu\ttype,misc,size=(%u,%u,%u) cpu%u,next_prev_tid=%u,tid=%u  time:(%lu), (+%lu)\n",
+            log_info("event: %lu/%lu\ttype,misc,size=(%u,%u,%u) cpu%u,next_prev_tid=%u,tid=%u  time:(%lu), (+%lu)\n",
                        h0, head1, record.type, record.misc, record.size, record.cpu,
                        record.next_prev_tid, record.tid, record.time, record.time - ev.last_event_timestamp);
         }
@@ -959,8 +955,8 @@ struct CpuContextSwitchTracker : public ITraceEventDumper {
         }
 
         if (head0 != head1) {
-            log_printf("head0(%lu) != head1(%lu)\n", head0, head1);
-            abort_with_perror("ring buffer head mismatch");
+            log_info("head0(%lu) != head1(%lu)\n", head0, head1);
+            log_abort("ring buffer head mismatch");
         }
 
         // update tail so kernel can keep generate event records
@@ -1227,14 +1223,14 @@ struct PerfCounterGroup : public ITraceEventDumper {
             write_trace_event(fw, d, tsc);
         }
         recorded_snapshots.clear();
-        std::cout << LINUX_PERF_"#" << dumper_serial_id << "(" << this << ") finalize: dumped " << data_size << std::endl;
+        std::cout << LINUX_PERF_PREFIX() << "#" << dumper_serial_id << "(" << this << ") finalize: dumped " << data_size << std::endl;
     }
 
     uint64_t operator[](size_t i) {
         if (i < counter_descriptors.size()) {
             return values[i];
         } else {
-            log_printf(LINUX_PERF_"PerfCounterGroup: operator[] with index %lu oveflow (>%lu)\n", i, counter_descriptors.size());
+            log_info(LINUX_PERF_PREFIX() "PerfCounterGroup: operator[] with index %lu oveflow (>%lu)\n", i, counter_descriptors.size());
             abort();
         }
     }
@@ -1479,19 +1475,19 @@ struct PerfCounterGroup : public ITraceEventDumper {
                 return fd;
             }
             if (!pev_attr->exclude_kernel && !has_retried_with_exclude_kernel) {
-                log_printf(LINUX_PERF_"perf_event_open(type=%d,config=%lld) with exclude_kernel=0 failed (due to /proc/sys/kernel/perf_event_paranoid is 2),  set exclude_kernel=1 and retry...\n",
+                log_info(LINUX_PERF_PREFIX() "perf_event_open(type=%d,config=%lld) with exclude_kernel=0 failed (due to /proc/sys/kernel/perf_event_paranoid is 2),  set exclude_kernel=1 and retry...\n",
                            pev_attr->type, pev_attr->config);
                 pev_attr->exclude_kernel = 1;
                 has_retried_with_exclude_kernel = true;
                 continue;
             }
-            log_printf(LINUX_PERF_"perf_event_open(type=%d,config=%lld) failed", pev_attr->type, pev_attr->config);
-            abort_with_perror("");
+            log_info(LINUX_PERF_PREFIX() "perf_event_open(type=%d,config=%lld) failed", pev_attr->type, pev_attr->config);
+            log_abort("");
         }
     }
 
     perf_event_mmap_page* mmap_event_page(int fd, size_t mmap_length) {
-        return map_perf_event_metadata_or_abort(fd, mmap_length, LINUX_PERF_"mmap perf_event_mmap_page failed:");
+        return map_perf_event_metadata_or_abort(fd, mmap_length, LINUX_PERF_PREFIX() "mmap perf_event_mmap_page failed:");
     }
 
     // The first event opened becomes the group leader.
@@ -1621,7 +1617,7 @@ struct PerfCounterGroup : public ITraceEventDumper {
                 addinfo(duration_ns, &pmc[0], log);
             }
             safe_snprintf("\n");
-            log_message(log_buff);
+            log_info(log_buff);
         }
         return pmc;
     }
@@ -1633,21 +1629,21 @@ struct PerfCounterGroup : public ITraceEventDumper {
         for(size_t i = 0; i < counter_descriptors.size(); i++) values[i] = 0;
 
         if (::read(leader_fd, read_buffer, sizeof(read_buffer)) == -1) {
-            abort_with_perror(LINUX_PERF_"read perf event failed:");
+            log_abort(LINUX_PERF_PREFIX() "read perf event failed:");
         }
 
         uint64_t * readv = read_buffer;
         auto nr = *readv++;
         if (verbose) {
-            log_printf("number of counters:\t%lu\n", nr);
+            log_info("number of counters:\t%lu\n", nr);
         }
         if (read_format & PERF_FORMAT_TOTAL_TIME_ENABLED) {
             auto val = *readv++;
-            if (verbose) { log_printf("time_enabled:\t%lu\n", val); }
+            if (verbose) { log_info("time_enabled:\t%lu\n", val); }
         }
         if (read_format & PERF_FORMAT_TOTAL_TIME_RUNNING) {
             auto val = *readv++;
-            if (verbose) { log_printf("time_running:\t%lu\n", val); }
+            if (verbose) { log_info("time_running:\t%lu\n", val); }
         }
 
         for (size_t i = 0; i < nr; i++) {
@@ -1662,7 +1658,7 @@ struct PerfCounterGroup : public ITraceEventDumper {
 
         if (verbose) {
             for (size_t k = 0; k < counter_descriptors.size(); k++) {
-                log_printf("\t[%lu]: %lu\n", k, values[k]);
+                log_info("\t[%lu]: %lu\n", k, values[k]);
             }
         }
     }
