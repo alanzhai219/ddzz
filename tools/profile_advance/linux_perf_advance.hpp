@@ -187,7 +187,7 @@ struct TimestampConverter {
 // ============================================================================
 // Section: Trace Output -- Dumper Interface and JSON Writer
 // ITraceEventDumper interface, TraceFileWriter singleton (Chrome Trace format
-// output), and CrossLibrarySingleton for shared-memory based process-wide
+// output), and SharedMemorySingletonHandle for shared-memory based process-wide
 // singleton that survives across multiple .so boundaries.
 // ============================================================================
 
@@ -199,11 +199,99 @@ public:
     virtual void dump_json(std::ofstream& fw, TimestampConverter& tsc) = 0;
 };
 
+namespace detail {
+
+// Cross-library singleton via POSIX shared memory.
+//
+// Problem: a C++ static-local singleton in a header-only library gets a
+// separate instance in each .so that includes the header.  We need exactly
+// one shared instance per process.
+//
+// Solution: use shm_open to create a process-wide shared memory region that
+// stores a pointer to the single heap-allocated instance.
+//
+// Protocol:
+//   1. All users in the same process shm_open the same named region.
+//   2. The first to CAS init_lock_pid from 0 owns initialization (creates the object).
+//   3. Others spin on init_done_pid until the owner signals completion.
+//   4. Reference counting via reference_count controls destruction.
+template<class T>
+struct SharedMemorySingletonHandle {
+    static constexpr size_t kSharedMemorySize = 4096;
+
+    // Layout of the shared memory region (fits in one page).
+    struct SharedMemoryBlock {
+        T * instance_ptr;
+        int64_t reference_count;
+        pid_t init_lock_pid;    // PID that claimed the initialization lock
+        pid_t init_done_pid;    // set to PID when initialization is complete
+    };
+
+    const char* shared_memory_name;
+    SharedMemoryBlock* shared_block;
+    T * instance_ptr;
+
+    explicit SharedMemorySingletonHandle(const char* shared_memory_name)
+        : shared_memory_name(shared_memory_name) {
+        int fd = shm_open(shared_memory_name, O_CREAT | O_RDWR, 0600);
+        if (fd < 0) {
+            log_abort("shm_open failed!");
+        }
+        if (ftruncate(fd, 4096) != 0) {
+            close(fd);
+            log_abort("ftruncate failed!");
+        }
+        shared_block = reinterpret_cast<SharedMemoryBlock*>(
+                mmap(NULL, kSharedMemorySize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
+        close(fd);
+        if (shared_block == MAP_FAILED) {
+            log_abort("mmap shared memory failed!");
+        }
+
+        pid_t pid = getpid();
+        pid_t expected = 0;
+        if (__atomic_compare_exchange_n(&shared_block->init_lock_pid,
+                                        &expected,
+                                        pid,
+                                        false,
+                                        __ATOMIC_SEQ_CST,
+                                        __ATOMIC_SEQ_CST)) {
+            // We acquired the initialization slot for this shared block.
+            shared_block->instance_ptr = new T();
+            __atomic_store_n(&shared_block->reference_count, 0, __ATOMIC_SEQ_CST);
+            __atomic_store_n(&shared_block->init_done_pid, pid, __ATOMIC_SEQ_CST);
+        } else {
+            // Spin until the owner has published the initialized instance.
+            while (__atomic_load_n(&shared_block->init_done_pid, __ATOMIC_SEQ_CST) == 0);
+        }
+        __atomic_add_fetch(&shared_block->reference_count, 1, __ATOMIC_SEQ_CST);
+
+        instance_ptr = shared_block->instance_ptr;
+    }
+    T& obj() {
+        return *(instance_ptr);
+    }
+    ~SharedMemorySingletonHandle() {
+        const auto remaining_references = __atomic_sub_fetch(&shared_block->reference_count, 1, __ATOMIC_SEQ_CST);
+        if (remaining_references == 0) {
+            delete shared_block->instance_ptr;
+            shm_unlink(shared_memory_name);
+        }
+        munmap(shared_block, kSharedMemorySize);
+    }
+};
+
+} // namespace detail
+
 // Aggregates all registered ITraceEventDumper instances and writes a single
 // perf_dump.json in Chrome Trace Event Format (viewable in chrome://tracing
 // or Perfetto).  Uses a cross-library singleton to ensure exactly one writer
 // per process, even when this header is compiled into multiple shared libraries.
 struct TraceFileWriter {
+    static std::string shared_memory_name() {
+        return std::string("/linuxperf_trace_file_writer_shm_") + std::to_string(getpid());
+    }
+
     std::mutex writer_mutex;
     std::set<ITraceEventDumper*> registered_dumpers;
     const char* output_filename = "perf_dump.json";
@@ -211,6 +299,8 @@ struct TraceFileWriter {
     std::ofstream output_stream;
     std::atomic_int registered_dumper_count{0};
     TimestampConverter timestamp_converter;
+
+    TraceFileWriter() = default;
 
     ~TraceFileWriter() {
         if (needs_finalization) {
@@ -277,70 +367,9 @@ struct TraceFileWriter {
         return serial_id;
     }
 
-    // Cross-library singleton via POSIX shared memory.
-    //
-    // Problem: a C++ static-local singleton in a header-only library gets a
-    // separate instance in each .so that includes the header.  We need exactly
-    // one TraceFileWriter per process.
-    //
-    // Solution: use shm_open to create a process-wide shared memory region that
-    // stores a pointer to the single heap-allocated instance.
-    //
-    // Protocol:
-    //   1. All users in the same process shm_open the same named region.
-    //   2. The first to CAS init_lock_pid owns initialization (creates the object).
-    //   3. Others spin on init_done_pid until the owner signals completion.
-    //   4. Reference counting via reference_count controls destruction.
-    template<class T>
-    struct CrossLibrarySingleton {
-        static constexpr const char * shm_name = "/linuxperf_shm01";
-
-        // Layout of the shared memory region (fits in one page).
-        struct SharedMemoryBlock {
-            T * instance_ptr;
-            int64_t reference_count;
-            pid_t init_lock_pid;    // PID that claimed the initialization lock
-            pid_t init_done_pid;    // set to PID when initialization is complete
-        };
-
-        SharedMemoryBlock* shared_block;
-        T * instance_ptr;
-
-        CrossLibrarySingleton() {
-            int fd = shm_open(shm_name, O_CREAT | O_RDWR, 0600);
-            if (ftruncate(fd, 4096) != 0) {
-                log_abort("ftruncate failed!");
-            }
-            pid_t pid = getpid();
-            shared_block = reinterpret_cast<SharedMemoryBlock*>(mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
-            if (__atomic_exchange_n(&shared_block->init_lock_pid, pid, __ATOMIC_SEQ_CST) != pid) {
-                // we are the first one that set init_lock_pid to pid, do initialization
-                shared_block->instance_ptr = new T();
-                __atomic_store_n(&shared_block->reference_count, 0, __ATOMIC_SEQ_CST);
-                __atomic_store_n(&shared_block->init_done_pid, pid, __ATOMIC_SEQ_CST);
-            } else {
-                // spin until the owner has done
-                while (__atomic_load_n(&shared_block->init_done_pid, __ATOMIC_SEQ_CST) != pid);
-            }
-            __atomic_add_fetch(&shared_block->reference_count, 1, __ATOMIC_SEQ_CST);
-            close(fd);
-
-            instance_ptr = shared_block->instance_ptr;
-        }
-        T& obj() {
-            return *(instance_ptr);
-        }
-        ~CrossLibrarySingleton() {
-            if (__atomic_sub_fetch(&shared_block->reference_count, 1, __ATOMIC_SEQ_CST) == 0) {
-                delete shared_block->instance_ptr;
-                munmap(shared_block, 4096);
-            }
-            shm_unlink(shm_name);
-        }
-    };
-
     static TraceFileWriter& get() {
-        static CrossLibrarySingleton<TraceFileWriter> inst;
+        static const std::string shm_name = shared_memory_name();
+        static detail::SharedMemorySingletonHandle<TraceFileWriter> inst(shm_name.c_str());
         return inst.obj();
     }
 };
