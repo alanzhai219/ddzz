@@ -62,6 +62,12 @@ void matmul_no_spill(float* C, const float* A, const float* B, int N) {
 
 **核心思想：** 如果一个值被加载到寄存器后能被多次使用，就摊薄了 load 的开销。
 
+> 6x16 micro-kernel的意思是`C`的shape是6x16。也就是：A[6, k] * B[k, 16] = C[6, 16]
+> 
+> for循环是按k展开，每次循环正好计算一轮：A[6, 1] * B[1, 16] = C[6, 16]
+>
+> k轮的C[6, 16]累加，就是A[6, k] * B[k, 16]的结果
+
 ### Case：GEMM 的寄存器分块（6x16 micro-kernel）
 
 ```cpp
