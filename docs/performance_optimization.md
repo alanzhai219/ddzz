@@ -181,6 +181,11 @@ void micro_kernel_6x16_avx2(int K,
                             const float* B, int ldb,
                             float* C, int ldc) {
     // 6行 x 2列ymm = 12个累加器
+    //           ymm       ymm
+    // r0: [0 ................. 7]    [8 ................ 15]
+    // r1: [0 ................. 7]    [8 ................ 15]
+    // ...
+    // r5: [0 ................. 7]    [8 ................ 15]
     __m256 c00 = _mm256_setzero_ps(), c01 = _mm256_setzero_ps();  // row 0
     __m256 c10 = _mm256_setzero_ps(), c11 = _mm256_setzero_ps();  // row 1
     __m256 c20 = _mm256_setzero_ps(), c21 = _mm256_setzero_ps();  // row 2
@@ -253,6 +258,284 @@ void micro_kernel_6x16_avx2(int K,
 - `_mm256_broadcast_ss` 直接从内存 broadcast，不需要先 load 再 shuffle
 - 如果改成 8x16 tile（16个累加器），就会超出16个ymm → 产生 spill
 - 实际中也可选择 4x24（4行 x 3个ymm列 = 12累加器）等替代方案
+
+### AVX-512 寄存器利用率优化：从 6x16 到更大 Tile
+
+#### 问题识别
+
+当前 AVX-512 的 6x16 micro-kernel 只用了 8 个 zmm 寄存器（6 累加器 + 1 B load + 1 A broadcast），而 AVX-512 提供了 32 个。寄存器利用率仅 25%，意味着硬件资源被大量浪费。
+
+#### 方法论：最大化算术强度（Arithmetic Intensity）
+
+优化的核心方法论是：**在寄存器预算允许的范围内，增大 tile 尺寸以提高每次内存访问所执行的计算量。**
+
+具体推导过程：
+
+1. **确定约束**：32 个 zmm 寄存器是硬性上限
+2. **建立模型**：对于 MR×NR 的 tile（NR 为 16 的倍数），所需寄存器 = MR×(NR/16) 累加器 + NR/16 个 B load + 1 个 A broadcast
+3. **选择目标**：最大化每次 K 迭代的 FMA 数量（= MR × NR/16），同时考虑 FMA 流水线延迟隐藏
+4. **验证可行性**：确保不 spill，且 L1 带宽能喂饱计算单元
+
+#### FMA 流水线延迟隐藏
+
+现代 Intel AVX-512 的 FMA 指令延迟 ~4 cycles，吞吐 2/cycle（port 0 + port 5）。要充分填满流水线，需要至少 **8 条相互独立的 FMA 指令** 同时 in-flight。当前 6x16 每次迭代只有 6 条 FMA，不足以完全隐藏延迟。
+
+**体系结构深度解析：**
+
+**延迟 ~4 cycles 的含义：** FMA 是单条指令完成 `a = a * b + c`，但在执行单元内部需经过多个流水线阶段（乘法→对齐→加法→规格化），从 operand 就绪到结果可被后续指令使用，需要等待 4 个时钟周期。如果下一条 FMA 依赖上一条的结果（如 `c0 = fma(a, b, c0)` 后紧跟 `c0 = fma(x, y, c0)`），第二条必须等 4 cycles 才能开始。
+
+**吞吐 2/cycle 的含义：** Skylake-X/Ice Lake 的 AVX-512 FMA 有两个独立执行端口（port 0 和 port 5），每个端口每 cycle 可接收一条新 FMA。峰值吞吐为每 cycle 发射 2 条 FMA——前提是指令间无数据依赖。
+
+**所需独立指令数推导：**
+
+```
+所需独立指令数 = 延迟 × 吞吐 = 4 cycles × 2 条/cycle = 8 条
+```
+
+直觉：想象一个旋转调度的"指令池"——
+
+```
+cycle 0: 发射 fma(c0), fma(c1)     ← c0, c1 结果要到 cycle 4 才就绪
+cycle 1: 发射 fma(c2), fma(c3)     ← c2, c3 要到 cycle 5
+cycle 2: 发射 fma(c4), fma(c5)     ← c4, c5 要到 cycle 6
+cycle 3: 发射 fma(c6), fma(c7)     ← c6, c7 要到 cycle 7
+cycle 4: 发射 fma(c0), fma(c1)     ← c0 在 cycle 4 就绪，刚好可以再用!
+cycle 5: 发射 fma(c2), fma(c3)     ← 完美衔接，零气泡
+...
+```
+
+8 条独立 FMA 链（8 个不同累加器）形成恰好填满流水线的旋转调度。每个累加器被使用后，经过 4 cycles（期间其他 7 条指令执行），轮到自己时结果刚好就绪。
+
+**6x16 为什么不够（6 条独立 FMA）：**
+
+```
+cycle 0: fma(c0), fma(c1)    ← port 0, port 5 各发射一条
+cycle 1: fma(c2), fma(c3)
+cycle 2: fma(c4), fma(c5)
+cycle 3: ???                  ← 没有更多独立FMA! c0要到cycle 4才就绪, 产生1cycle气泡
+cycle 4: fma(c0), fma(c1)    ← c0终于就绪，重新开始
+```
+
+峰值利用率 = 6/8 = **75%**，每 4 cycle 有 1 cycle 空转。
+
+**6x48 如何解决（18 条独立 FMA）：**
+
+```
+cycle 0: fma(c00), fma(c01)
+cycle 1: fma(c02), fma(c10)
+cycle 2: fma(c11), fma(c12)
+cycle 3: fma(c20), fma(c21)    ← 流水线持续满载，无需等待任何结果
+...
+cycle 8: fma(c50), fma(c51)
+cycle 9: fma(c52), ...         ← 新一轮K迭代, c00早在cycle 4就绪
+```
+
+18 >> 8，流水线永远不会因数据依赖而停顿。多出的余量还能容忍 B load 和 A broadcast 指令插入时占用的发射槽位。
+
+**性能瓶颈本质：**
+
+```
+Performance = min(计算吞吐上限, 内存带宽上限, 流水线填充率 × 吞吐上限)
+                                                ↑ 6x16的瓶颈在这里
+
+6x16: 流水线填充率 = 6/8 = 75%   → 实际吞吐 = 75% × 峰值
+6x48: 流水线填充率 = min(18/8, 1) = 100% → 实际吞吐 = 100% × 峰值
+```
+
+**核心结论：无 spill 是必要条件，填满流水线才是充分条件。**
+
+#### `_mm512_set1_ps`（broadcast）是否会打断 FMA 流水线？
+
+答案是**不会**。虽然 micro-kernel 中 broadcast 和 FMA 交替出现，但从微架构层面看它们是并行执行的。
+
+**原因一：使用不同的执行端口，且编译器会融合为内存操作数**
+
+实际编译中 `_mm512_set1_ps(A[i*lda + k])` 通常被融合为内存形式的 broadcast，不占用 FMA 端口：
+
+```asm
+vbroadcastss zmm0, dword [rax]     ; 走 load port，直接从内存broadcast
+vfmadd231ps  zmm6, zmm0, zmm3     ; FMA 走 Port 0/5
+```
+
+**原因二：乱序执行引擎并行调度**
+
+现代 CPU 是乱序超标量的，调度器会将无依赖关系的指令并行发射到不同端口：
+
+```
+cycle N:   vbroadcastss zmm0, [addr_A0]    → Load port
+cycle N:   vfmadd231ps  zmm10, zmm1, zmm3  → Port 0   ← 与broadcast同cycle执行!
+cycle N+1: vfmadd231ps  zmm11, zmm0, zmm3  → Port 0   ← zmm0就绪后立即使用
+```
+
+**原因三：依赖链分析——broadcast 不在关键路径上**
+
+FMA 流水线的瓶颈是**累加器的 RAW 依赖**（c00 写后读）。broadcast 结果只是 FMA 的一个输入操作数，属于独立的短依赖链：
+
+```
+关键路径（累加器）:  c00 → fma → c00 → fma → c00 ...  (间隔4 cycles)
+非关键路径（broadcast）:  load A[i] → broadcast → 送入fma operand (~1-3 cycles)
+```
+
+broadcast 延迟 ~1-3 cycles（L1 命中），远小于累加器链的 4 cycle 间隔，被完全掩盖在 FMA 延迟的"阴影"中。
+
+**原因四：端口压力验证（以 6x48 为例）**
+
+```
+每次K迭代: 6次broadcast + 3次B load + 18次FMA = 27条微操作
+FMA 需要:  18 ÷ 2端口 = 9 cycles (计算 bound)
+Load/broadcast: 9 ÷ 2 load ports = 4.5 cycles (内存 bound)
+
+计算时间(9) > 内存时间(4.5) → broadcast 完全被 FMA 延迟掩盖，不是瓶颈
+```
+
+**总结：**
+
+| 因素 | 是否打断 | 原因 |
+|------|---------|------|
+| 端口冲突 | 否 | broadcast 走 load port 或被融合为内存操作数 |
+| 数据依赖 | 否 | broadcast 结果不在累加器关键路径上 |
+| 延迟掩盖 | 否 | ~1-3 cycles 被 FMA 4 cycle 间隔完全掩盖 |
+| 乱序调度 | 否 | CPU 将 broadcast 和无关 FMA 并行发射 |
+
+#### Tile 尺寸设计空间
+
+| Tile | 累加器 | B load | A broadcast | 总 zmm | FMA/iter | A 复用率 |
+|------|--------|--------|-------------|--------|----------|----------|
+| 6x16 (当前) | 6 | 1 | 1 | 8 | 6 | 6x |
+| 6x32 | 12 | 2 | 1 | 15 | 12 | 6x |
+| **6x48** | 18 | 3 | 1 | **22** | **18** | 6x |
+| 14x16 | 14 | 1 | 1 | 16 | 14 | 14x |
+| 12x32 | 24 | 2 | 1 | 27 | 24 | 12x |
+| 14x32 | 28 | 2 | 1 | 31 | 28 | 14x |
+| 30x16 | 30 | 1 | 1 | 32 | 30 | 30x |
+
+#### 设计权衡
+
+- **增大列数（NR）**：每次 A broadcast 做更多 FMA，但需要更多 B load，占用 L1 读带宽
+- **增大行数（MR）**：每次 B load 被更多行复用，提高 A 复用率，但需要更多 broadcast 指令
+- **行业实践**：BLIS 在 Skylake-X 上用 30x16（极致 A 复用），OneDNN 用 6x64 的变体（极致列宽）
+
+#### 推荐方案：6x48 micro-kernel
+
+选择 6x48 的理由：
+1. 保持 MR=6 不变，outer loop 结构无需调整
+2. 18 条独立 FMA 充分隐藏流水线延迟（18 > 8）
+3. 22 个 zmm 使用率 69%，留有余量避免编译器临时变量导致 spill
+4. 每次 B load 仍被 6 行复用，带宽效率不变
+
+```cpp
+#include <immintrin.h>
+
+// 6x48 register blocking micro-kernel for AVX-512
+// C[6x48] = A[6xK] * B[Kx48]
+// 寄存器预算: 6x3=18(累加器) + 3(B load) + 1(A broadcast) = 22个zmm
+// 每次K迭代: 18次FMA, 充分隐藏FMA延迟(需>=8条独立FMA)
+void micro_kernel_6x48(int K,
+                       const float* A, int lda,
+                       const float* B, int ldb,
+                       float* C, int ldc) {
+    // 18个累加器: 6行 x 3段(每段16 floats = 1个zmm)
+    __m512 c00 = _mm512_setzero_ps(), c01 = _mm512_setzero_ps(), c02 = _mm512_setzero_ps();
+    __m512 c10 = _mm512_setzero_ps(), c11 = _mm512_setzero_ps(), c12 = _mm512_setzero_ps();
+    __m512 c20 = _mm512_setzero_ps(), c21 = _mm512_setzero_ps(), c22 = _mm512_setzero_ps();
+    __m512 c30 = _mm512_setzero_ps(), c31 = _mm512_setzero_ps(), c32 = _mm512_setzero_ps();
+    __m512 c40 = _mm512_setzero_ps(), c41 = _mm512_setzero_ps(), c42 = _mm512_setzero_ps();
+    __m512 c50 = _mm512_setzero_ps(), c51 = _mm512_setzero_ps(), c52 = _mm512_setzero_ps();
+
+    for (int k = 0; k < K; k++) {
+        // load B[k, 0:48] — 3段, 每段16 floats
+        __m512 b0 = _mm512_loadu_ps(&B[k * ldb]);
+        __m512 b1 = _mm512_loadu_ps(&B[k * ldb + 16]);
+        __m512 b2 = _mm512_loadu_ps(&B[k * ldb + 32]);
+
+        __m512 a;
+        // 每个A元素broadcast后与3段B做FMA — 每组B load被复用6次
+        a = _mm512_set1_ps(A[0*lda + k]);
+        c00 = _mm512_fmadd_ps(a, b0, c00);
+        c01 = _mm512_fmadd_ps(a, b1, c01);
+        c02 = _mm512_fmadd_ps(a, b2, c02);
+
+        a = _mm512_set1_ps(A[1*lda + k]);
+        c10 = _mm512_fmadd_ps(a, b0, c10);
+        c11 = _mm512_fmadd_ps(a, b1, c11);
+        c12 = _mm512_fmadd_ps(a, b2, c12);
+
+        a = _mm512_set1_ps(A[2*lda + k]);
+        c20 = _mm512_fmadd_ps(a, b0, c20);
+        c21 = _mm512_fmadd_ps(a, b1, c21);
+        c22 = _mm512_fmadd_ps(a, b2, c22);
+
+        a = _mm512_set1_ps(A[3*lda + k]);
+        c30 = _mm512_fmadd_ps(a, b0, c30);
+        c31 = _mm512_fmadd_ps(a, b1, c31);
+        c32 = _mm512_fmadd_ps(a, b2, c32);
+
+        a = _mm512_set1_ps(A[4*lda + k]);
+        c40 = _mm512_fmadd_ps(a, b0, c40);
+        c41 = _mm512_fmadd_ps(a, b1, c41);
+        c42 = _mm512_fmadd_ps(a, b2, c42);
+
+        a = _mm512_set1_ps(A[5*lda + k]);
+        c50 = _mm512_fmadd_ps(a, b0, c50);
+        c51 = _mm512_fmadd_ps(a, b1, c51);
+        c52 = _mm512_fmadd_ps(a, b2, c52);
+    }
+
+    // store results: C += accumulated
+    _mm512_storeu_ps(&C[0*ldc],    _mm512_add_ps(_mm512_loadu_ps(&C[0*ldc]),    c00));
+    _mm512_storeu_ps(&C[0*ldc+16], _mm512_add_ps(_mm512_loadu_ps(&C[0*ldc+16]), c01));
+    _mm512_storeu_ps(&C[0*ldc+32], _mm512_add_ps(_mm512_loadu_ps(&C[0*ldc+32]), c02));
+    _mm512_storeu_ps(&C[1*ldc],    _mm512_add_ps(_mm512_loadu_ps(&C[1*ldc]),    c10));
+    _mm512_storeu_ps(&C[1*ldc+16], _mm512_add_ps(_mm512_loadu_ps(&C[1*ldc+16]), c11));
+    _mm512_storeu_ps(&C[1*ldc+32], _mm512_add_ps(_mm512_loadu_ps(&C[1*ldc+32]), c12));
+    _mm512_storeu_ps(&C[2*ldc],    _mm512_add_ps(_mm512_loadu_ps(&C[2*ldc]),    c20));
+    _mm512_storeu_ps(&C[2*ldc+16], _mm512_add_ps(_mm512_loadu_ps(&C[2*ldc+16]), c21));
+    _mm512_storeu_ps(&C[2*ldc+32], _mm512_add_ps(_mm512_loadu_ps(&C[2*ldc+32]), c22));
+    _mm512_storeu_ps(&C[3*ldc],    _mm512_add_ps(_mm512_loadu_ps(&C[3*ldc]),    c30));
+    _mm512_storeu_ps(&C[3*ldc+16], _mm512_add_ps(_mm512_loadu_ps(&C[3*ldc+16]), c31));
+    _mm512_storeu_ps(&C[3*ldc+32], _mm512_add_ps(_mm512_loadu_ps(&C[3*ldc+32]), c32));
+    _mm512_storeu_ps(&C[4*ldc],    _mm512_add_ps(_mm512_loadu_ps(&C[4*ldc]),    c40));
+    _mm512_storeu_ps(&C[4*ldc+16], _mm512_add_ps(_mm512_loadu_ps(&C[4*ldc+16]), c41));
+    _mm512_storeu_ps(&C[4*ldc+32], _mm512_add_ps(_mm512_loadu_ps(&C[4*ldc+32]), c42));
+    _mm512_storeu_ps(&C[5*ldc],    _mm512_add_ps(_mm512_loadu_ps(&C[5*ldc]),    c50));
+    _mm512_storeu_ps(&C[5*ldc+16], _mm512_add_ps(_mm512_loadu_ps(&C[5*ldc+16]), c51));
+    _mm512_storeu_ps(&C[5*ldc+32], _mm512_add_ps(_mm512_loadu_ps(&C[5*ldc+32]), c52));
+}
+```
+
+**6x16 vs 6x48 对比：**
+
+| | 6x16 (原始) | 6x48 (优化) |
+|---|---|---|
+| zmm 使用量 | 8/32 (25%) | 22/32 (69%) |
+| FMA/iter | 6 | 18 |
+| B load/iter | 1 | 3 |
+| A broadcast/iter | 6 | 6 |
+| 流水线利用 | 不充分（6 < 8） | 充分（18 > 8） |
+| 理论加速比 | 1x | **3x** |
+| C tile 大小 | 6×16 = 96 floats | 6×48 = 288 floats |
+
+#### 方法论总结：Micro-Kernel Tile 尺寸选择四步法
+
+```
+1. 盘点硬件资源
+   ├── 可用向量寄存器数（AVX-512: 32 zmm, AVX2: 16 ymm）
+   ├── FMA 延迟和吞吐（确定最小独立指令数）
+   └── L1 读端口带宽（确定每cycle能发射几个load）
+
+2. 建立寄存器预算方程
+   总寄存器 ≥ MR × (NR/向量宽度) + (NR/向量宽度) + 1 + 编译器余量
+
+3. 在约束内最大化 FMA 密度
+   ├── 目标: FMA/iter = MR × (NR/向量宽度) ≥ FMA延迟 × FMA吞吐
+   ├── 行数MR ↑ → A复用率高，但broadcast指令多
+   └── 列数NR ↑ → 每个broadcast做更多FMA，但B load带宽压力大
+
+4. 验证与调优
+   ├── 编译汇编确认无 spill（搜索 [rsp] 访问）
+   ├── 用 perf stat 测 IPC 和 cache miss rate
+   └── 实测不同 tile 组合，选吞吐最优者
+```
 
 ---
 
