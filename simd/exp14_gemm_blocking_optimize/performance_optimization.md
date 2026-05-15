@@ -62,6 +62,25 @@ void matmul_no_spill(float* C, const float* A, const float* B, int N) {
 
 **核心思想：** 如果一个值被加载到寄存器后能被多次使用，就摊薄了 load 的开销。
 
+Register blocking 还是一个偏方法论的概念：它强调的是“把计算结果和热点数据尽量留在寄存器里”。真正把这个思想落到代码上时，常见载体就是 `micro-kernel`。
+
+它和单纯的 loop unroll 不同。unroll 只是把循环展开；register blocking 则会主动按 `MR x NR` 的输出 tile 来规划寄存器中的累加器布局，让一个小块 `C` 在整个 `K` 维累计过程中始终常驻寄存器。
+
+因此，学习顺序可以按这条主线理解：
+
+- **Register blocking**：寄存器级的数据复用思想
+- **Micro-kernel**：把这种思想写成最内层的小计算内核
+- **Macro-kernel**：在外层高效组织和重复调用 micro-kernel
+- **Cache blocking**：继续向外控制数据驻留在哪一级 cache
+
+---
+
+## 3. Micro-Kernel（微内核）
+
+在 GEMM 这类高性能实现里，`micro-kernel` 指最内层的小计算内核，一次只计算一个很小的 `C` tile，比如 `6x16`、`6x48`。它直接面对寄存器、SIMD 指令和 FMA 流水线，是 register blocking 的直接实现。
+
+通常说一个 `6x16 micro-kernel`，本质上就是：固定一次只更新 `C[6,16]` 这个小块，并让它在整个 `K` 维累计过程中尽量常驻寄存器。
+
 > 6x16 micro-kernel的意思是`C`的shape是6x16。也就是：A[6, k] * B[k, 16] = C[6, 16]
 > 
 > for循环是按k展开，每次循环正好计算一轮：A[6, 1] * B[1, 16] = C[6, 16]
@@ -539,7 +558,73 @@ void micro_kernel_6x48(int K,
 
 ---
 
-## 3. Cache Blocking（缓存分块 / Loop Tiling）
+## 4. Macro-Kernel（宏内核）
+
+如果说 `micro-kernel` 负责把一个小块算快，那么 `macro-kernel` 负责把这个小块高效地重复很多次。
+
+> **micro-kernel 解决怎么快算一个小块，macro-kernel 解决怎么高效地反复调用这个小块去算完整个大块。**
+
+在 GEMM 里，`macro-kernel` 通常是包在 `micro-kernel` 外面的一层或几层块级调度逻辑。它负责：
+
+- 组织 `A panel / B panel / C block` 的分块关系
+- 安排 packing，把访问模式变成连续内存
+- 选择 `jr/ir` 等小块遍历顺序
+- 让同一批 panel 被反复送给 `micro-kernel` 复用
+
+可以先看一个极简框架：
+
+```cpp
+for (jc ...)          // outer blocking, often L3-related
+    for (pc ...)        // panel blocking, often L2-related
+        pack_B(...)
+        for (ic ...)      // panel blocking, often L2/L1-related
+            pack_A(...)
+            for (jr ...)    // macro-kernel repeatedly walks small column tiles
+                for (ir ...)  // macro-kernel repeatedly walks small row tiles
+                    micro_kernel(MR, NR, KC, ...);
+```
+
+这里最里面的 `micro_kernel(...)` 是寄存器级内核；围绕它反复遍历 `jr/ir` 小块并复用 packed panel 的那部分，就是常说的 `macro-kernel`。
+
+把它写成函数后，通常长这样：
+
+```cpp
+constexpr int MR = 6;
+constexpr int NR = 16;
+
+// macro-kernel: 负责在一个 C block 上反复调用 micro-kernel
+// packed_A: [mc x kc]
+// packed_B: [kc x nc]
+// C block : [mc x nc]
+void macro_kernel_6x16(int mc, int nc, int kc,
+                       const float* packed_A,
+                       const float* packed_B,
+                       float* C, int ldc) {
+    for (int jr = 0; jr < nc; jr += NR) {
+        for (int ir = 0; ir < mc; ir += MR) {
+            micro_kernel_6x16(kc,
+                              &packed_A[ir * kc], kc,
+                              &packed_B[jr * kc], kc,
+                              &C[ir * ldc + jr], ldc);
+        }
+    }
+}
+```
+
+这个函数本身不直接做寄存器级 FMA；它的职责是遍历一个更大的 `C block`，把其中每个 `MR x NR` 小块交给 `micro_kernel_6x16(...)` 去算。
+
+如果把职责拆开，可以更清楚地看到分工：
+
+- `micro-kernel` 只关心一个 `MR x NR` 小块怎么算得快，例如 `6x16` 的外积累加。
+- `macro-kernel` 关心的是 `packed_A` 和 `packed_B` 怎么准备、`jr/ir` 的遍历顺序怎么安排、以及同一批 panel 如何喂给很多次 `micro-kernel`。
+- 更外层的 cache blocking 决定数据主要驻留在哪一级 cache，并为 `macro-kernel` 提供稳定的数据来源。
+
+因此，`macro-kernel` 可以理解为连接 cache blocking 和 register blocking 的桥梁：
+
+- 往里看，它服务 `micro-kernel`
+- 往外看，它承接 L1/L2/L3 的分块和 packing
+
+## 5. Cache Blocking（缓存分块 / Loop Tiling）
 
 将大数据集的操作分块，使每个块的工作集能放进某一级 cache（L1/L2/L3），避免反复从更高层级甚至内存加载数据。
 
@@ -556,6 +641,9 @@ constexpr int MC = 256;  // A的行分块 (fits in L2 with B panel)
 constexpr int KC = 256;  // K维分块 (A panel + B panel fit in L2)
 constexpr int NC = 1024; // B的列分块 (fits in L3)
 
+// 这段外层 cache blocking 负责准备 panel 并调用 macro-kernel。
+// macro-kernel 再继续把一个 C block 切成很多个 MR x NR 小块，
+// 每个小块最终由 micro-kernel 完成寄存器级计算。
 void gemm_cache_blocked(int M, int N, int K,
                         const float* A, const float* B, float* C) {
     // L3 blocking: B的列方向
@@ -578,15 +666,11 @@ void gemm_cache_blocked(int M, int N, int K,
 
                 // 此时 packed_A (MC*KC = 256*256 = 256KB) 在 L2
                 //      packed_B 的当前列 (KC*NR) 在 L1
-                // 调用 register-blocked micro-kernel
-                for (int jr = 0; jr < nc; jr += 16) {
-                    for (int ir = 0; ir < mc; ir += 6) {
-                        micro_kernel_6x16(kc,
-                                          &packed_A[ir * kc], kc,
-                                          &packed_B[jr * kc], kc,
-                                          &C[(ic+ir)*N + (jc+jr)], N);
-                    }
-                }
+                // 这里把当前 panel 交给 macro-kernel 处理。
+                macro_kernel_6x16(mc, nc, kc,
+                                  packed_A,
+                                  packed_B,
+                                  &C[ic * N + jc], N);
             }
         }
     }
@@ -683,14 +767,48 @@ MC  │  [MC×KC] │ ◄─────►    │                              
 └─────────────────────────────────────────┘
 ```
 
+### 如何理解这些层级
+
+可以把它们理解为一条从外到内的数据供给链：Memory -> L3 -> L2 -> L1 -> Registers。
+
+如果只想抓住工程上的主线，可以记成：
+
+- **寄存器 + L1** 属于最内层的 kernel 供给链。Register blocking 决定 micro-kernel 一次在寄存器里累计多大的 `C` tile；L1 blocking 负责把马上要消费的 `A/B` 小片段留在 L1，持续给寄存器喂数。
+- **L2 blocking** 是主分块层。它决定 `A panel` 和 `B panel` 的主体工作集大小，使同一批数据能被很多次 micro-kernel 调用反复复用，而不必频繁回退到 L3 或内存。
+- **L3 blocking** 是更外层的容量分块。它主要减少对内存的访问压力，为 L2 blocking 提供更大的上层缓冲。
+
+因此，`L1 blocking` 和 `register blocking` 不是同一个层级，但它们通常协同工作，属于最内层优化链条；而 `L2 blocking` 往往才是调 `MC/KC` 这类主分块参数时最核心的一层。
+
 ---
 
-## 三者关系总结
+## 层次关系总结
 
 | 概念 | 目标层级 | 核心思想 |
 |------|----------|----------|
 | Register Spill | 寄存器 ↔ 栈 | **避免**超出寄存器容量，减少不必要的 load/store |
 | Register Blocking | 寄存器 | **最大化**寄存器中数据的复用次数 |
+| Micro-Kernel | 最内层计算内核 | 把寄存器分块写成具体的 `MR x NR` 小核 |
+| Macro-Kernel | 小块调度层 | 高效组织并重复调用 micro-kernel |
 | Cache Blocking | Cache各级 | 控制工作集大小，使数据**驻留**在目标cache层 |
 
-它们是互补的：cache blocking 把数据送到 L1，register blocking 把 L1 数据送到寄存器并最大化复用，而控制好 blocking 的尺寸可以避免 register spill。高性能 GEMM 库（如 OpenBLAS、MKL）同时运用三者。
+它们是互补的：cache blocking 决定大块数据如何驻留在 L3/L2/L1，macro-kernel 负责在这些 panel 上组织小块遍历，micro-kernel 把寄存器分块真正执行出来，而控制好 blocking 的尺寸可以避免 register spill。高性能 GEMM 库（如 OpenBLAS、MKL）通常同时运用这几层。
+
+### 软件层次 vs 硬件层次
+
+从软件-硬件映射的角度看，这几层存在很强的对应关系，但通常不是严格的一一映射，而是“主要作用在哪一级硬件层次”。
+
+| 软件层次 | 主要目标 | 主要硬件落点 |
+|----------|----------|--------------|
+| Register Blocking | 让小块结果和热点临时值常驻寄存器 | Register |
+| Micro-Kernel | 用 SIMD/FMA 高效计算一个 `MR x NR` 小块 | Register + L1 |
+| Macro-Kernel | 反复调度 micro-kernel，复用 packed panel | L1 + L2 |
+| Cache Blocking | 控制更大工作集驻留在哪级 cache | L2 + L3 + Memory |
+
+如果只抓最核心的映射关系，可以记成：
+
+- `Register blocking` 主要对应 `Register`
+- `Micro-kernel` 主要对应 `Register + L1`
+- `Macro-kernel` 主要对应 `L1 + L2`
+- `Cache blocking` 主要对应 `L2 + L3 + Memory`
+
+之所以不是严格的一一对应，是因为软件层次回答的是“怎样组织计算与数据复用”，硬件层次回答的是“数据实际驻留在哪里”。两者高度相关，但一个软件概念通常会跨越不止一层硬件。
