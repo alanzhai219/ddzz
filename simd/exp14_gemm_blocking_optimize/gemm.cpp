@@ -97,8 +97,8 @@ void macro_kernel_4x24(size_t mc, size_t nc, size_t kc,
     }
 }
 
-constexpr size_t MC = 256;
-constexpr size_t NC = 256;
+constexpr size_t MC = 240;
+constexpr size_t NC = 240;
 constexpr size_t KC = 1024;
 
 void gemm_opt_6x16(const float* A, const float* B, float* C, size_t M, size_t N, size_t K) {
