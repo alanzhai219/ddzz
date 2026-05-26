@@ -112,7 +112,7 @@ inline void log_abort(const char* message) {
 // raw monotonic timestamps (nanoseconds) to microseconds for trace output.
 // ============================================================================
 
-inline uint64_t get_time_ns() {
+inline size_t get_time_ns() {
     struct timespec tp0;
     if (clock_gettime(CLOCK_MONOTONIC_RAW, &tp0) != 0) {
         log_abort(LINUX_PERF_PREFIX() "clock_gettime(CLOCK_MONOTONIC_RAW,...) failed!");
@@ -121,18 +121,18 @@ inline uint64_t get_time_ns() {
 }
 
 #ifdef __x86_64__
-inline uint64_t read_tsc(void) {
+inline size_t read_tsc(void) {
     return __rdtsc();
 }
-inline uint64_t read_pmc(int index) {
+inline size_t read_pmc(int index) {
     return __rdpmc(index);
 }
 #endif
 
 #ifdef __aarch64__
 // SPDX-License-Identifier: GPL-2.0
-inline uint64_t read_tsc(void) {
-    uint64_t val;
+inline size_t read_tsc(void) {
+    size_t val;
     /*
      * According to ARM DDI 0487F.c, from Armv8.0 to Armv8.5 inclusive, the
      * system counter is at least 56 bits wide; from Armv8.6, the counter
@@ -143,9 +143,9 @@ inline uint64_t read_tsc(void) {
     asm volatile("mrs %0, cntvct_el0" : "=r" (val));
     return val;
 }
-inline uint64_t read_pmc(int index) {
+inline size_t read_pmc(int index) {
     (void)index;
-    uint64_t val;
+    size_t val;
     asm volatile("mrs %0, PMCCNTR_EL0" : "=r"(val));
     return val;
 }
@@ -156,11 +156,11 @@ inline uint64_t read_pmc(int index) {
 // Despite the legacy name "tsc", this now uses clock_gettime directly,
 // avoiding the ~1s calibration sleep that a real TSC approach would need.
 struct TimestampConverter {
-    uint64_t ticks_per_second;
-    uint64_t base_tick;
+    size_t ticks_per_second;
+    size_t base_tick;
 
     // Convert an absolute timestamp to microseconds relative to base.
-    double ticks_to_usec(uint64_t ticks) const {
+    double ticks_to_usec(size_t ticks) const {
         if (ticks < base_tick) {
             return 0;
         }
@@ -168,7 +168,7 @@ struct TimestampConverter {
     }
 
     // Convert a [start, end] timestamp pair to a duration in microseconds.
-    double duration_usec(uint64_t start_ticks, uint64_t end_ticks) const {
+    double duration_usec(size_t start_ticks, size_t end_ticks) const {
         if (end_ticks < start_ticks) {
             return 0;
         }
@@ -288,10 +288,6 @@ struct SharedMemorySingletonHandle {
 // or Perfetto).  Uses a cross-library singleton to ensure exactly one writer
 // per process, even when this header is compiled into multiple shared libraries.
 struct TraceFileWriter {
-    static std::string shared_memory_name() {
-        return std::string("/linuxperf_trace_file_writer_shm_") + std::to_string(getpid());
-    }
-
     std::mutex writer_mutex;
     std::set<ITraceEventDumper*> registered_dumpers;
     const char* output_filename = "perf_dump.json";
@@ -372,6 +368,10 @@ struct TraceFileWriter {
         static detail::SharedMemorySingletonHandle<TraceFileWriter> inst(shm_name.c_str());
         return inst.obj();
     }
+
+    static std::string shared_memory_name() {
+        return std::string("/linuxperf_trace_file_writer_shm_") + std::to_string(getpid());
+    }
 };
 
 // ============================================================================
@@ -396,12 +396,12 @@ inline std::vector<std::string> str_split(const std::string& s, std::string deli
 
 // Parse a list of 1-3 hex/decimal values into an X86_RAW_EVENT config.
 // Accepts any single-character delimiter (e.g. "-" from env var, "," from EventSpec).
-inline uint64_t parse_raw_event_values(const std::vector<std::string>& parts) {
+inline size_t parse_raw_event_values(const std::vector<std::string>& parts) {
     if (parts.empty()) { return 0; }
     auto evsel = std::strtoull(parts[0].c_str(), nullptr, 0);
     if (parts.size() == 1) { return evsel; }
     auto umask = std::strtoull(parts[1].c_str(), nullptr, 0);
-    uint64_t cmask = 0;
+    size_t cmask = 0;
     if (parts.size() >= 3) {
         cmask = std::strtoull(parts[2].c_str(), nullptr, 0);
     }
@@ -414,7 +414,7 @@ inline uint64_t parse_raw_event_values(const std::vector<std::string>& parts) {
 // ============================================================================
 
 inline perf_event_attr make_perf_event_attr(uint32_t type,
-                                            uint64_t config,
+                                            size_t config,
                                             bool exclude_kernel,
                                             bool include_total_time,
                                             bool pinned) {
@@ -457,7 +457,7 @@ private:
 // Read a value of type T from the perf ring buffer at the given offset,
 // handling wrap-around via (offset % data_size).  Advances offset by sizeof(T).
 template<typename T>
-T& read_ring_buffer(perf_event_mmap_page& meta, uint64_t& offset) {
+T& read_ring_buffer(perf_event_mmap_page& meta, size_t& offset) {
     auto offset0 = offset;
     offset += sizeof(T);
     return *reinterpret_cast<T*>(reinterpret_cast<uint8_t*>(&meta) + meta.data_offset + (offset0)%meta.data_size);
@@ -497,9 +497,9 @@ inline perf_event_mmap_page* map_perf_event_metadata_or_abort(int fd, size_t mma
 // internally by read_ring_buffer via (offset % data_size).
 struct RingBufferReader {
     perf_event_mmap_page& meta;
-    uint64_t offset;
+    size_t offset;
 
-    RingBufferReader(perf_event_mmap_page& meta, uint64_t offset) : meta(meta), offset(offset) {}
+    RingBufferReader(perf_event_mmap_page& meta, size_t offset) : meta(meta), offset(offset) {}
 
     template<typename T>
     T read() {
@@ -520,7 +520,7 @@ struct ContextSwitchRecord {
     uint32_t next_prev_tid = 0;
     uint32_t pid = 0;
     uint32_t tid = 0;
-    uint64_t time = 0;
+    size_t time = 0;
     uint32_t cpu = 0;
     uint32_t reserved0 = 0;
 
@@ -535,7 +535,7 @@ struct ContextSwitchRecord {
         }
         record.pid = cursor.read<__u32>();
         record.tid = cursor.read<__u32>();
-        record.time = cursor.read<uint64_t>();
+        record.time = cursor.read<size_t>();
         record.cpu = cursor.read<__u32>();
         record.reserved0 = cursor.read<__u32>();
         return record;
@@ -680,11 +680,11 @@ struct PerfConfig {
     int64_t dump_limit = 0;                                     // 0 = dump disabled
     cpu_set_t cpu_affinity_mask;
     bool context_switch_enabled = false;
-    std::vector<std::pair<std::string, uint64_t>> custom_pmu_events;
+    std::vector<std::pair<std::string, size_t>> custom_pmu_events;
 
     // Parse a hex or dash-separated PMU event config string.
     // Formats: "0x10d1" or "EventSel-UMask-CMask"
-    uint64_t parse_pmu_event_hex(const std::string& raw_evt) const {
+    size_t parse_pmu_event_hex(const std::string& raw_evt) const {
         auto delimiter = (raw_evt.find('-') != std::string::npos) ? "-" : "";
         auto parts = delimiter[0] ? str_split(raw_evt, delimiter) : std::vector<std::string>{raw_evt};
         return parse_raw_event_values(parts);
@@ -811,9 +811,9 @@ struct CpuContextSwitchTracker : public ITraceEventDumper {
         int fd;
         perf_event_mmap_page * pmeta;
         int cpu;
-        uint64_t switch_in_timestamp;       // when the current TID switched in
-        uint64_t switch_in_tid;             // which TID switched in
-        uint64_t last_event_timestamp;      // timestamp of the last processed record
+        size_t switch_in_timestamp;       // when the current TID switched in
+        size_t switch_in_tid;             // which TID switched in
+        size_t last_event_timestamp;      // timestamp of the last processed record
 
         PerCpuState(int fd, perf_event_mmap_page * pmeta): fd(fd), pmeta(pmeta) {}
     };
@@ -919,7 +919,7 @@ struct CpuContextSwitchTracker : public ITraceEventDumper {
     }
 
     // Record a completed time slice: [switch_in_timestamp, switch_out_time].
-    void record_switch_out(PerCpuState& ev, uint32_t tid, uint32_t cpu, uint64_t time, __u16 misc) {
+    void record_switch_out(PerCpuState& ev, uint32_t tid, uint32_t cpu, size_t time, __u16 misc) {
         recorded_slices.emplace_back();
         auto* pd = &recorded_slices.back();
         pd->tid = tid;
@@ -935,7 +935,7 @@ struct CpuContextSwitchTracker : public ITraceEventDumper {
     }
 
     // Parse one record from the ring buffer and update the switch-in/out state machine.
-    void parse_one_record(PerCpuState& ev, perf_event_mmap_page& mmap_meta, uint64_t& head0, uint64_t head1) {
+    void parse_one_record(PerCpuState& ev, perf_event_mmap_page& mmap_meta, size_t& head0, size_t head1) {
         const auto h0 = head0;
         RingBufferReader cursor(mmap_meta, head0);
         const ContextSwitchRecord record = ContextSwitchRecord::parse(cursor);
@@ -969,8 +969,8 @@ struct CpuContextSwitchTracker : public ITraceEventDumper {
     // After draining, advances data_tail so the kernel can reuse the space.
     void drain_ring_buffer(PerCpuState& ev) {
         auto& mmap_meta = *ev.pmeta;
-        uint64_t head0 = mmap_meta.data_tail;
-        const uint64_t head1 = mmap_meta.data_head;
+        size_t head0 = mmap_meta.data_tail;
+        const size_t head1 = mmap_meta.data_head;
 
         if (head0 == head1) {
             return;
@@ -1021,8 +1021,8 @@ struct CpuContextSwitchTracker : public ITraceEventDumper {
 
     // A time slice where a particular TID was running on a particular CPU.
     struct TimeSlice {
-        uint64_t tsc_start;
-        uint64_t tsc_end;
+        size_t tsc_start;
+        size_t tsc_end;
         uint32_t tid;
         uint32_t cpu;
         bool preempt;   // preempt means current TID preempts previous thread
@@ -1106,23 +1106,23 @@ struct PerfCounterGroup : public ITraceEventDumper {
     static constexpr size_t kReadBufferU64Count = 512;
 
     int leader_fd = -1;                 // fd of the group leader event
-    uint64_t read_format;
+    size_t read_format;
 
     // Describes a single counter within the group.
     struct CounterDescriptor {
         int fd = -1;
-        uint64_t id = 0;
-        uint64_t pmc_index = 0;        // >0 if rdpmc fast path is available
+        size_t id = 0;
+        size_t pmc_index = 0;        // >0 if rdpmc fast path is available
         perf_event_mmap_page* pmeta = nullptr;
         std::string name = "?";
         char format[32];
     };
     std::vector<CounterDescriptor> counter_descriptors;
 
-    uint64_t read_buffer[kReadBufferU64Count]; // 4KB
-    uint64_t pmc_bit_width;
-    uint64_t pmc_value_mask;            // bitmask applied to rdpmc result
-    uint64_t values[32];
+    size_t read_buffer[kReadBufferU64Count]; // 4KB
+    size_t pmc_bit_width;
+    size_t pmc_value_mask;            // bitmask applied to rdpmc result
+    size_t values[32];
     uint32_t tsc_time_shift;
     uint32_t tsc_time_mult;
 
@@ -1135,13 +1135,13 @@ struct PerfCounterGroup : public ITraceEventDumper {
     // A snapshot of counter values for one profiled scope.
     // Contains start/end timestamps, counter deltas, and optional extra data.
     struct ScopedSnapshot {
-        uint64_t tsc_start;
-        uint64_t tsc_end;
+        size_t tsc_start;
+        size_t tsc_end;
         std::string title;
         std::string cat;
         int32_t id;
         static const int data_size = 16; // 4(fixed) + 8(PMU) + 4(software)
-        uint64_t data[data_size] = {0};
+        size_t data[data_size] = {0};
         TypeErasedArgStorage<data_size> extra_data;
 
         ScopedSnapshot(std::string title, std::string cat = {})
@@ -1161,14 +1161,14 @@ struct PerfCounterGroup : public ITraceEventDumper {
     std::deque<ScopedSnapshot> recorded_snapshots;
     int dumper_serial_id;
 
-    using CustomArgsSerializer = std::function<void(std::ostream& fw, double usec, uint64_t* counters)>;
+    using CustomArgsSerializer = std::function<void(std::ostream& fw, double usec, size_t* counters)>;
     CustomArgsSerializer custom_args_serializer;
 
     // --- JSON serialization helpers ---
 
     void emit_custom_args(std::stringstream& ss, double duration, const ScopedSnapshot& d) const {
         if (custom_args_serializer) {
-            custom_args_serializer(ss, duration, const_cast<uint64_t*>(d.data));
+            custom_args_serializer(ss, duration, const_cast<size_t*>(d.data));
         }
     }
 
@@ -1255,7 +1255,7 @@ struct PerfCounterGroup : public ITraceEventDumper {
         std::cout << LINUX_PERF_PREFIX() << "#" << dumper_serial_id << "(" << this << ") finalize: dumped " << data_size << std::endl;
     }
 
-    uint64_t operator[](size_t i) {
+    size_t operator[](size_t i) {
         if (i < counter_descriptors.size()) {
             return values[i];
         } else {
@@ -1294,7 +1294,7 @@ struct PerfCounterGroup : public ITraceEventDumper {
     }
 
     // Capture counter values at scope end, compute deltas, optionally export to a map.
-    uint64_t* capture_end_counters(ScopedSnapshot& snapshot, std::map<std::string, uint64_t>* ext_data = nullptr) {
+    size_t* capture_end_counters(ScopedSnapshot& snapshot, std::map<std::string, size_t>* ext_data = nullptr) {
         const size_t num_counters = active_counter_count();
 
         snapshot.stop();
@@ -1342,9 +1342,9 @@ struct PerfCounterGroup : public ITraceEventDumper {
         EventSpec(std::string str) {
             parse_from_string(str);
         }
-        EventSpec(uint32_t type, uint64_t config, const char * name = "?") : type(type), config(config), name(name) {}
+        EventSpec(uint32_t type, size_t config, const char * name = "?") : type(type), config(config), name(name) {}
 
-        static bool try_parse_named_config(const std::string& str, uint32_t& type, uint64_t& config) {
+        static bool try_parse_named_config(const std::string& str, uint32_t& type, size_t& config) {
             if (str == "HW_CPU_CYCLES" || str == "cycles") {
                 type = PERF_TYPE_HARDWARE;
                 config = PERF_COUNT_HW_CPU_CYCLES;
@@ -1380,7 +1380,7 @@ struct PerfCounterGroup : public ITraceEventDumper {
             }
         }
         uint32_t type;
-        uint64_t config;
+        size_t config;
         std::string name;
     };
 
@@ -1462,7 +1462,7 @@ struct PerfCounterGroup : public ITraceEventDumper {
         }
     }
 
-    void open_raw_counter(uint64_t config, bool pinned=false) {
+    void open_raw_counter(size_t config, bool pinned=false) {
         perf_event_attr pea = make_perf_event_attr(PERF_TYPE_RAW,
                                                    config,
                                                    true,
@@ -1471,7 +1471,7 @@ struct PerfCounterGroup : public ITraceEventDumper {
         open_counter(&pea);
     }
 
-    void open_hardware_counter(uint64_t config, bool pinned=false) {
+    void open_hardware_counter(size_t config, bool pinned=false) {
         perf_event_attr pea = make_perf_event_attr(PERF_TYPE_HARDWARE,
                                                    config,
                                                    true,
@@ -1480,7 +1480,7 @@ struct PerfCounterGroup : public ITraceEventDumper {
         open_counter(&pea);
     }
 
-    void open_software_counter(uint64_t config) {
+    void open_software_counter(size_t config) {
         // some SW events are counted in kernel, so keep exclude_kernel=false.
         perf_event_attr pea = make_perf_event_attr(PERF_TYPE_SOFTWARE,
                                                    config,
@@ -1572,10 +1572,10 @@ struct PerfCounterGroup : public ITraceEventDumper {
         counters_active = true;
     }
 
-    uint64_t tsc_ticks_to_nanoseconds(uint64_t cyc) {
-        uint64_t quot, rem;
+    size_t tsc_ticks_to_nanoseconds(size_t cyc) {
+        size_t quot, rem;
         quot  = cyc >> tsc_time_shift;
-        rem   = cyc & (((uint64_t)1 << tsc_time_shift) - 1);
+        rem   = cyc & (((size_t)1 << tsc_time_shift) - 1);
         return quot * tsc_time_mult + ((rem * tsc_time_mult) >> tsc_time_shift);
     }
 
@@ -1597,7 +1597,7 @@ struct PerfCounterGroup : public ITraceEventDumper {
     // Measure a lambda: read counters before and after, return counter deltas.
     // Optionally prints a formatted summary line if `name` is non-empty.
     template<class FN>
-    std::vector<uint64_t> measure(FN fn, std::string name = {}, int64_t loop_cnt = 0, std::function<void(uint64_t, uint64_t*, char*&)> addinfo = {}) {
+    std::vector<size_t> measure(FN fn, std::string name = {}, int64_t loop_cnt = 0, std::function<void(size_t, size_t*, char*&)> addinfo = {}) {
         ScopedSnapshot snap("measure");
         capture_start_counters(snap);
 
@@ -1608,7 +1608,7 @@ struct PerfCounterGroup : public ITraceEventDumper {
         capture_end_counters(snap);
 
         const size_t cnt = active_counter_count();
-        std::vector<uint64_t> pmc(snap.data, snap.data + cnt);
+        std::vector<size_t> pmc(snap.data, snap.data + cnt);
 
         if (!name.empty()) {
             char log_buff[1024];
@@ -1661,7 +1661,7 @@ struct PerfCounterGroup : public ITraceEventDumper {
             log_abort(LINUX_PERF_PREFIX() "read perf event failed:");
         }
 
-        uint64_t * readv = read_buffer;
+        size_t * readv = read_buffer;
         auto nr = *readv++;
         if (verbose) {
             log_info("number of counters:\t%lu\n", nr);
@@ -1741,7 +1741,7 @@ struct PerfCounterGroup : public ITraceEventDumper {
             return *this;
         }
 
-        uint64_t* finish(std::map<std::string, uint64_t>* ext_data = nullptr) {
+        size_t* finish(std::map<std::string, size_t>* ext_data = nullptr) {
             if (do_unlock) {
                 PerfCounterGroup::sampling_lock() --;
             }
@@ -1751,7 +1751,7 @@ struct PerfCounterGroup : public ITraceEventDumper {
             }
 
             num_events = pevg->active_counter_count();
-            uint64_t* result = pevg->capture_end_counters(*pd, ext_data);
+            size_t* result = pevg->capture_end_counters(*pd, ext_data);
 
             pevg = nullptr;
             return result;
