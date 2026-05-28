@@ -8,6 +8,10 @@
 
 配套示例见 [sample_profile.cpp](/home/xiuchuan/xiuchuan/workspace/ddzz/tools/profile_advance/sample_profile.cpp)。
 
+```bash
+echo 0 | sudo tee /proc/sys/kernel/perf_event_paranoid
+```
+
 ## 1. 这份头文件做了什么
 
 `linux_perf_advance.hpp` 是一个 header-only 的轻量 profiler 封装，它把 Linux `perf_event_open` 这套底层接口包装成了更容易直接嵌入业务代码的 C++ API。
