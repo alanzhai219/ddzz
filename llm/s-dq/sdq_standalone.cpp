@@ -75,24 +75,83 @@ bool is_nibble_format(WeightFormat weight_format) {
     return weight_format == WeightFormat::U4 || weight_format == WeightFormat::I4;
 }
 
+struct QuantizedWeights {
+    std::vector<int32_t> qweight;
+    std::vector<float> weight_scales;
+    std::vector<float> weight_zero_points;
+};
+
+QuantizedWeights quantize_weights_per_group(const std::vector<float>& wei, int k, int n,
+                                            int group_size, WeightFormat weight_format) {
+    const int group_count = k / group_size;
+    const auto qrange = get_weight_range(weight_format);
+
+    QuantizedWeights result;
+    result.qweight.resize(k * n, 0);
+    result.weight_scales.resize(group_count * n, 0.0f);
+    result.weight_zero_points.resize(group_count * n, 0.0f);
+
+    const int zp_max = std::min(qrange.qmax, 15);
+
+    for (int group = 0; group < group_count; ++group) {
+        const int begin = group * group_size;
+        const int end = begin + group_size;
+
+        for (int col = 0; col < n; ++col) {
+            float wmin = std::numeric_limits<float>::max();
+            float wmax = std::numeric_limits<float>::lowest();
+
+            for (int k_idx = begin; k_idx < end; ++k_idx) {
+                const float val = wei[index2d(k_idx, col, n)];
+                wmin = std::min(wmin, val);
+                wmax = std::max(wmax, val);
+            }
+
+            float scale;
+            int zp;
+
+            if (qrange.is_unsigned) {
+                scale = (wmax != wmin) ? (wmax - wmin) / qrange.qmax : 1.0f;
+                zp = (scale != 0.0f) ? static_cast<int>(-std::round(wmin / scale)) : 0;
+                zp = std::max(0, std::min(zp, zp_max));
+            } else {
+                const float amax = std::max(std::abs(wmin), std::abs(wmax));
+                scale = (amax != 0.0f) ? amax / qrange.qmax : 1.0f;
+                zp = 0;
+            }
+
+            result.weight_scales[index2d(group, col, n)] = scale;
+            result.weight_zero_points[index2d(group, col, n)] = static_cast<float>(zp);
+
+            for (int k_idx = begin; k_idx < end; ++k_idx) {
+                int32_t qval;
+                if (scale != 0.0f) {
+                    const float scaled = wei[index2d(k_idx, col, n)] / scale;
+                    const float rounded = std::round(scaled) + zp;
+                    const float clamped = std::max(static_cast<float>(qrange.qmin),
+                                                  std::min(static_cast<float>(qrange.qmax), rounded));
+                    qval = static_cast<int32_t>(clamped);
+                } else {
+                    qval = zp;
+                }
+                result.qweight[index2d(k_idx, col, n)] = qval;
+            }
+        }
+    }
+
+    return result;
+}
+
 Problem make_problem(const ProblemConfig& cfg, std::mt19937& rng) {
     Problem problem;
     problem.cfg = cfg;
 
-    const auto qrange = get_weight_range(cfg.weight_format);
-
-    const int group_count = cfg.k / cfg.group_size;
     problem.src.resize(cfg.m * cfg.k);
-    problem.qweight.resize(cfg.k * cfg.n);
-    problem.weight_scales.resize(group_count * cfg.n);
-    problem.weight_zero_points.resize(group_count * cfg.n);
     problem.bias.resize(cfg.n);
 
     std::normal_distribution<float> src_dist(0.0f, 1.0f);
+    std::normal_distribution<float> wei_dist(0.0f, 1.0f);
     std::normal_distribution<float> bias_dist(0.0f, 0.5f);
-    std::uniform_real_distribution<float> scale_dist(0.005f, 0.055f);
-    std::uniform_int_distribution<int> qwei_dist(qrange.qmin, qrange.qmax);
-    std::uniform_int_distribution<int> zp_dist(0, 15);
 
     for (float& value : problem.src) {
         value = src_dist(rng);
@@ -101,24 +160,15 @@ Problem make_problem(const ProblemConfig& cfg, std::mt19937& rng) {
         value = bias_dist(rng);
     }
 
-    for (int group = 0; group < group_count; ++group) {
-        for (int col = 0; col < cfg.n; ++col) {
-            problem.weight_scales[index2d(group, col, cfg.n)] = scale_dist(rng);
-            if (qrange.is_unsigned) {
-                const int zp_upper = std::min(qrange.qmax, 15);
-                std::uniform_int_distribution<int> zp_local(0, zp_upper);
-                problem.weight_zero_points[index2d(group, col, cfg.n)] = static_cast<float>(zp_local(rng));
-            } else {
-                problem.weight_zero_points[index2d(group, col, cfg.n)] = 0.0f;
-            }
-        }
+    std::vector<float> wei(cfg.k * cfg.n);
+    for (float& value : wei) {
+        value = wei_dist(rng);
     }
 
-    for (int k_idx = 0; k_idx < cfg.k; ++k_idx) {
-        for (int col = 0; col < cfg.n; ++col) {
-            problem.qweight[index2d(k_idx, col, cfg.n)] = qwei_dist(rng);
-        }
-    }
+    auto qwei_data = quantize_weights_per_group(wei, cfg.k, cfg.n, cfg.group_size, cfg.weight_format);
+    problem.qweight = std::move(qwei_data.qweight);
+    problem.weight_scales = std::move(qwei_data.weight_scales);
+    problem.weight_zero_points = std::move(qwei_data.weight_zero_points);
 
     return problem;
 }

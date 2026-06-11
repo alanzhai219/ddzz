@@ -32,7 +32,7 @@ def weight_value_range(weight_format: WeightFormat):
     if weight_format == WeightFormat.U8:
         return 0, 255, True
     if weight_format == WeightFormat.I8:
-        return -127, 127, False
+        return -128, 127, False
     if weight_format == WeightFormat.U4:
         return 0, 15, True
     if weight_format == WeightFormat.I4:
@@ -40,23 +40,62 @@ def weight_value_range(weight_format: WeightFormat):
     raise ValueError(f"Unsupported weight format: {weight_format}")
 
 
-def make_random_problem(cfg: SDQConfig):
-    assert cfg.k % cfg.group_size == 0
-    group_count = cfg.k // cfg.group_size
+def quantize_weights_per_group(wei, group_size, weight_format: WeightFormat):
+    k, n = wei.shape
+    group_count = k // group_size
+    qmin, qmax, is_unsigned = weight_value_range(weight_format)
 
-    src = torch.randn(cfg.m, cfg.k, dtype=torch.float32)
-
-    qmin, qmax, is_unsigned = weight_value_range(cfg.weight_format)
-    qweight = torch.randint(qmin, qmax + 1, (cfg.k, cfg.n), dtype=torch.int32)
+    weight_scales = torch.empty(group_count, n, dtype=torch.float32)
     if is_unsigned:
         zp_max = min(qmax, 15)
-        zero_points = torch.randint(0, zp_max + 1, (group_count, cfg.n), dtype=torch.float32)
+        zero_points = torch.empty(group_count, n, dtype=torch.float32)
     else:
-        zero_points = torch.zeros(group_count, cfg.n, dtype=torch.float32)
+        zero_points = torch.zeros(group_count, n, dtype=torch.float32)
 
-    weight_scales = 0.005 + 0.05 * torch.rand(group_count, cfg.n, dtype=torch.float32)
+    qweight = torch.empty(k, n, dtype=torch.int32)
+
+    for group in range(group_count):
+        begin = group * group_size
+        end = begin + group_size
+        wei_group = wei[begin:end, :]
+
+        for col in range(n):
+            wei_col = wei_group[:, col]
+            wmin = wei_col.min().item()
+            wmax = wei_col.max().item()
+
+            if is_unsigned:
+                scale = (wmax - wmin) / qmax if wmax != wmin else 1.0
+                zp = -round(wmin / scale) if scale != 0.0 else 0
+                zp = max(0, min(zp, zp_max))
+            else:
+                amax = max(abs(wmin), abs(wmax))
+                scale = amax / qmax if amax != 0.0 else 1.0
+                zp = 0
+
+            weight_scales[group, col] = scale
+            zero_points[group, col] = zp
+
+            if scale != 0.0:
+                qweight[begin:end, col] = torch.clamp(
+                    torch.round(wei_col / scale) + zp, qmin, qmax
+                ).to(torch.int32)
+            else:
+                qweight[begin:end, col] = zp
+
+    return qweight, weight_scales, zero_points
+
+
+def make_random_problem(cfg: SDQConfig):
+    assert cfg.k % cfg.group_size == 0
+
+    src = torch.randn(cfg.m, cfg.k, dtype=torch.float32)
+    wei = torch.randn(cfg.k, cfg.n, dtype=torch.float32)
+
+    qwei, wei_s, wei_zp = quantize_weights_per_group(wei, cfg.group_size, cfg.weight_format)
+
     bias = torch.randn(cfg.n, dtype=torch.float32)
-    return src, qweight, weight_scales, zero_points, bias
+    return src, qwei, wei_s, wei_zp, bias
 
 
 # =========================
