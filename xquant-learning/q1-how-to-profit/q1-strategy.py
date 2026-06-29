@@ -1,12 +1,18 @@
 import yfinance as yf
-import yfinance_cache as yfc
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import akshare as ak
 
 # 设置中文显示
-plt.rcParams['font.sans-serif'] = ['Arial Unicode MS', 'SimHei', 'STHeiti']
+plt.rcParams['font.sans-serif'] = [
+    'Arial Unicode MS', # Mac, Windows
+    'SimHei',           # Windows
+    'STHeiti',          # Mac
+    'Heiti TC',         # Mac
+    'Microsoft YaHei',  # Windows
+    'WenQuanYi Zen Hei',# Linux
+]
 plt.rcParams['axes.unicode_minus'] = False
 
 # 获取沪深300ETF日线数据（最近约5年）
