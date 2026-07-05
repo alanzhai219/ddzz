@@ -1,0 +1,7 @@
+{"event_names":["PAPI_TOT_CYC","PAPI_TOT_INS","PAPI_L1_DCM","PAPI_L2_TCM","PAPI_TLB_DM","PAPI_BR_MSP" ],"traces":[
+  {"name":"init_matrix","start_us":0,"dur_us":1622,"cycles":27268,"insns":2065166,"ipc":75.7359,"PAPI_L1_DCM":564,"PAPI_L2_TCM":1498,"PAPI_TLB_DM":6853,"PAPI_BR_MSP":0},
+  {"name":"matmul_naive","start_us":1627,"dur_us":186528,"cycles":789053408,"insns":939415704,"ipc":1.1906,"PAPI_L1_DCM":134100064,"PAPI_L2_TCM":241852587,"PAPI_TLB_DM":19267,"PAPI_BR_MSP":264189},
+  {"name":"compute_row_sums","start_us":188160,"dur_us":274,"cycles":1896643,"insns":927209,"ipc":0.4889,"PAPI_L1_DCM":47124,"PAPI_L2_TCM":110378,"PAPI_TLB_DM":28,"PAPI_BR_MSP":0},
+  {"name":"branching_kernel","start_us":188441,"dur_us":4,"cycles":3703,"insns":1919,"ipc":0.5182,"PAPI_L1_DCM":42,"PAPI_L2_TCM":34,"PAPI_TLB_DM":2,"PAPI_BR_MSP":0}
+  ]
+}
