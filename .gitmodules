@@ -4,3 +4,6 @@
 [submodule "3rdparty/ittapi"]
 	path = 3rdparty/ittapi
 	url = https://github.com/intel/ittapi.git
+[submodule "3rdparty/papi"]
+	path = 3rdparty/papi
+	url = https://github.com/icl-utk-edu/papi.git
