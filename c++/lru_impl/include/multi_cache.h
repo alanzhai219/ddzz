@@ -1,6 +1,5 @@
 #pragma once
 
-#include <atomic>
 #include <cstddef>
 #include <memory>
 #include <type_traits>
@@ -39,7 +38,7 @@ public:
      */
     template <typename KeyType,
               typename BuilderType,
-              typename ValueType = std::invoke_result_t<BuilderType&, const KeyType&>>
+              typename ValueType = typename std::result_of<BuilderType&(const KeyType&)>::type>
     typename CacheEntry<KeyType, ValueType>::ResultType getOrCreate(const KeyType& key, BuilderType builder) {
         auto entry = getEntry<KeyType, ValueType>();
         return entry->getOrCreate(key, std::move(builder));
@@ -48,7 +47,7 @@ public:
 private:
     template <typename T>
     static size_t getTypeId() {
-        static size_t id = _typeIdCounter.fetch_add(1);
+        static size_t id = nextTypeId();
         return id;
     }
 
@@ -64,7 +63,11 @@ private:
         return std::static_pointer_cast<EntryType>(itr->second);
     }
 
-    static inline std::atomic_size_t _typeIdCounter{0};
+    static size_t nextTypeId() {
+        static size_t counter = 0;
+        return counter++;
+    }
+
     size_t _capacity;
     std::unordered_map<size_t, EntryBasePtr> _storage;
 };

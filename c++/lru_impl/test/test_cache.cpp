@@ -122,12 +122,18 @@ void test_cache_entry_get_or_create() {
         return std::make_shared<int>(k.value * 10);
     };
 
-    auto [val1, s1] = entry.getOrCreate(IntKey{1}, builder);
+    lru::CacheEntry<IntKey, std::shared_ptr<int> >::ResultType result1 =
+        entry.getOrCreate(IntKey{1}, builder);
+    std::shared_ptr<int> val1 = result1.first;
+    lru::CacheEntryBase::LookUpStatus s1 = result1.second;
     TEST_ASSERT(s1 == lru::CacheEntryBase::LookUpStatus::Miss, "first access is miss");
     TEST_ASSERT(*val1 == 10, "builder produced correct value");
     TEST_ASSERT(build_count == 1, "builder called once");
 
-    auto [val2, s2] = entry.getOrCreate(IntKey{1}, builder);
+    lru::CacheEntry<IntKey, std::shared_ptr<int> >::ResultType result2 =
+        entry.getOrCreate(IntKey{1}, builder);
+    std::shared_ptr<int> val2 = result2.first;
+    lru::CacheEntryBase::LookUpStatus s2 = result2.second;
     TEST_ASSERT(s2 == lru::CacheEntryBase::LookUpStatus::Hit, "second access is hit");
     TEST_ASSERT(*val2 == 10, "cached value returned");
     TEST_ASSERT(build_count == 1, "builder not called on hit");
@@ -142,8 +148,14 @@ void test_cache_entry_zero_capacity() {
         return std::make_shared<int>(k.value);
     };
 
-    auto [v1, s1] = entry.getOrCreate(IntKey{1}, builder);
-    auto [v2, s2] = entry.getOrCreate(IntKey{1}, builder);
+    lru::CacheEntry<IntKey, std::shared_ptr<int> >::ResultType result1 =
+        entry.getOrCreate(IntKey{1}, builder);
+    std::shared_ptr<int> v1 = result1.first;
+    lru::CacheEntryBase::LookUpStatus s1 = result1.second;
+    lru::CacheEntry<IntKey, std::shared_ptr<int> >::ResultType result2 =
+        entry.getOrCreate(IntKey{1}, builder);
+    std::shared_ptr<int> v2 = result2.first;
+    lru::CacheEntryBase::LookUpStatus s2 = result2.second;
     TEST_ASSERT(s1 == lru::CacheEntryBase::LookUpStatus::Miss, "zero cap: always miss 1");
     TEST_ASSERT(s2 == lru::CacheEntryBase::LookUpStatus::Miss, "zero cap: always miss 2");
     TEST_ASSERT(build_count == 2, "zero cap: builder called every time");
@@ -162,11 +174,17 @@ void test_multi_cache_single_type() {
         return std::make_shared<int>(k.value * 100);
     };
 
-    auto [v1, s1] = cache.getOrCreate(IntKey{5}, builder);
+    lru::CacheEntry<IntKey, std::shared_ptr<int> >::ResultType result1 =
+        cache.getOrCreate(IntKey{5}, builder);
+    std::shared_ptr<int> v1 = result1.first;
+    lru::CacheEntryBase::LookUpStatus s1 = result1.second;
     TEST_ASSERT(s1 == lru::CacheEntryBase::LookUpStatus::Miss, "multi: first is miss");
     TEST_ASSERT(*v1 == 500, "multi: correct value");
 
-    auto [v2, s2] = cache.getOrCreate(IntKey{5}, builder);
+    lru::CacheEntry<IntKey, std::shared_ptr<int> >::ResultType result2 =
+        cache.getOrCreate(IntKey{5}, builder);
+    std::shared_ptr<int> v2 = result2.first;
+    lru::CacheEntryBase::LookUpStatus s2 = result2.second;
     TEST_ASSERT(s2 == lru::CacheEntryBase::LookUpStatus::Hit, "multi: second is hit");
     TEST_ASSERT(build_count == 1, "multi: builder called once");
 }
@@ -175,27 +193,39 @@ void test_multi_cache_heterogeneous() {
     lru::MultiCache cache(10);
 
     // Type pair 1: IntKey -> shared_ptr<int>
-    auto [v1, s1] = cache.getOrCreate(IntKey{1}, [](const IntKey& k) {
+    lru::CacheEntry<IntKey, std::shared_ptr<int> >::ResultType result1 =
+        cache.getOrCreate(IntKey{1}, [](const IntKey& k) {
         return std::make_shared<int>(k.value);
     });
+    std::shared_ptr<int> v1 = result1.first;
+    lru::CacheEntryBase::LookUpStatus s1 = result1.second;
     TEST_ASSERT(*v1 == 1, "hetero: int value correct");
 
     // Type pair 2: StringKey -> shared_ptr<std::string>
-    auto [v2, s2] = cache.getOrCreate(StringKey{"hello"}, [](const StringKey& k) {
+    lru::CacheEntry<StringKey, std::shared_ptr<std::string> >::ResultType result2 =
+        cache.getOrCreate(StringKey{"hello"}, [](const StringKey& k) {
         return std::make_shared<std::string>(k.value + " world");
     });
+    std::shared_ptr<std::string> v2 = result2.first;
+    lru::CacheEntryBase::LookUpStatus s2 = result2.second;
     TEST_ASSERT(*v2 == "hello world", "hetero: string value correct");
 
     // Verify both type pairs are independent (int cache still has its entry)
-    auto [v3, s3] = cache.getOrCreate(IntKey{1}, [](const IntKey&) {
+    lru::CacheEntry<IntKey, std::shared_ptr<int> >::ResultType result3 =
+        cache.getOrCreate(IntKey{1}, [](const IntKey&) {
         return std::make_shared<int>(999);  // should NOT be called
     });
+    std::shared_ptr<int> v3 = result3.first;
+    lru::CacheEntryBase::LookUpStatus s3 = result3.second;
     TEST_ASSERT(s3 == lru::CacheEntryBase::LookUpStatus::Hit, "hetero: int pair still cached");
     TEST_ASSERT(*v3 == 1, "hetero: int pair returns original value");
 
-    auto [v4, s4] = cache.getOrCreate(StringKey{"hello"}, [](const StringKey&) {
+    lru::CacheEntry<StringKey, std::shared_ptr<std::string> >::ResultType result4 =
+        cache.getOrCreate(StringKey{"hello"}, [](const StringKey&) {
         return std::make_shared<std::string>("should not happen");
     });
+    std::shared_ptr<std::string> v4 = result4.first;
+    lru::CacheEntryBase::LookUpStatus s4 = result4.second;
     TEST_ASSERT(s4 == lru::CacheEntryBase::LookUpStatus::Hit, "hetero: string pair still cached");
     TEST_ASSERT(*v4 == "hello world", "hetero: string pair returns original value");
 }
@@ -210,10 +240,13 @@ void test_multi_cache_eviction_per_type() {
     cache.getOrCreate(IntKey{3}, [](const IntKey& k) { return std::make_shared<int>(k.value); });
 
     int build_count = 0;
-    auto [v1, s1] = cache.getOrCreate(IntKey{1}, [&](const IntKey& k) {
+    lru::CacheEntry<IntKey, std::shared_ptr<int> >::ResultType result1 =
+        cache.getOrCreate(IntKey{1}, [&](const IntKey& k) {
         ++build_count;
         return std::make_shared<int>(k.value);
     });
+    std::shared_ptr<int> v1 = result1.first;
+    lru::CacheEntryBase::LookUpStatus s1 = result1.second;
     TEST_ASSERT(s1 == lru::CacheEntryBase::LookUpStatus::Miss, "eviction: key 1 was evicted");
     TEST_ASSERT(build_count == 1, "eviction: builder re-called for evicted key");
 }
