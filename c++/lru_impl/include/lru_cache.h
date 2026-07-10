@@ -91,7 +91,7 @@ public:
     Value get(const Key& key) {
         auto map_it = _cacheMapper.find(key);
         if (map_it == _cacheMapper.end()) {
-            return Value();
+            return Value(); // default-constructed value indicates a cache miss
         }
         touch(map_it->second);
         return _head->value.second;

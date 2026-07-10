@@ -19,11 +19,9 @@ namespace lru {
  */
 class MultiCache {
 public:
-    template <typename K, typename V>
-    using EntryTypeT = CacheEntry<K, V>;
     using EntryBasePtr = std::shared_ptr<CacheEntryBase>;
     template <typename K, typename V>
-    using EntryPtr = std::shared_ptr<EntryTypeT<K, V>>;
+    using EntryPtr = std::shared_ptr<CacheEntry<K, V>>;
 
     /**
      * @param capacity maximum records FOR EACH <Key, Value> type pair.
@@ -53,14 +51,14 @@ private:
 
     template <typename KeyType, typename ValueType>
     EntryPtr<KeyType, ValueType> getEntry() {
-        using EntryType = EntryTypeT<KeyType, ValueType>;
+        using EntryType = CacheEntry<KeyType, ValueType>;
         size_t id = getTypeId<EntryType>();
-        auto itr = _storage.find(id);
-        if (itr == _storage.end()) {
+        auto it = _storage.find(id);
+        if (it == _storage.end()) {
             auto result = _storage.insert({id, std::make_shared<EntryType>(_capacity)});
-            itr = result.first;
+            it = result.first;
         }
-        return std::static_pointer_cast<EntryType>(itr->second);
+        return std::static_pointer_cast<EntryType>(it->second);
     }
 
     static size_t nextTypeId() {

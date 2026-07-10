@@ -14,8 +14,12 @@ namespace lru {
  */
 class CacheEntryBase {
 public:
-    enum class LookUpStatus : int8_t { Hit, Miss };
     virtual ~CacheEntryBase() = default;
+
+    enum class LookUpStatus : int8_t {
+        Hit,
+        Miss
+    };
 };
 
 /**
@@ -32,7 +36,7 @@ public:
 template <typename KeyType, typename ValType, typename ImplType = LruCache<KeyType, ValType>>
 class CacheEntry : public CacheEntryBase {
 public:
-    using ResultType = std::pair<ValType, LookUpStatus>;
+    using ResultType = std::pair<ValType, CacheEntryBase::LookUpStatus>;
 
     explicit CacheEntry(size_t capacity) : _impl(capacity) {}
 
@@ -42,19 +46,20 @@ public:
      */
     ResultType getOrCreate(const KeyType& key, std::function<ValType(const KeyType&)> builder) {
         if (0 == _impl.getCapacity()) {
-            return {builder(key), LookUpStatus::Miss};
+            return {builder(key), CacheEntryBase::LookUpStatus::Miss};
         }
         ValType retVal = _impl.get(key);
+        // If the value is default-constructed, treat it as a cache miss and call the builder.
         if (retVal == ValType()) {
             retVal = builder(key);
             if (retVal != ValType()) {
                 _impl.put(key, retVal);
             }
-            return {retVal, LookUpStatus::Miss};
+            return {retVal, CacheEntryBase::LookUpStatus::Miss};
         }
-        return {retVal, LookUpStatus::Hit};
+        return {retVal, CacheEntryBase::LookUpStatus::Hit};
     }
-
+private:
     ImplType _impl;
 };
 
