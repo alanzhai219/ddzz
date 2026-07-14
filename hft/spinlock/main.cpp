@@ -6,19 +6,19 @@
 #include <mutex>
 #include <pthread.h>
 #include <immintrin.h>
-#include <string>
+#include <algorithm>
+#include <numeric>
 
-// ==========================================
-// 1. 自定义 HFT 自旋锁 (TTAS + Pause)
-// ==========================================
+#ifdef __linux__
+#include <sched.h>
+#endif
+
+// === 锁的实现 (同前) ===
 class alignas(64) HFTSpinlock {
-private:
     std::atomic<bool> locked_{false};
     inline void cpu_pause() const noexcept {
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
+#if defined(__x86_64__) || defined(_M_X64)
         _mm_pause(); 
-#elif defined(__aarch64__) || defined(__arm__)
-        asm volatile("yield" ::: "memory");
 #endif
     }
 public:
@@ -50,80 +50,115 @@ public:
 // 3. 标准互斥锁 (std::mutex)
 // ==========================================
 class alignas(64) StdMutexWrapper {
-private:
     std::mutex mtx_;
 public:
     void lock() { mtx_.lock(); }
     void unlock() { mtx_.unlock(); }
 };
 
-// ==========================================
-// 辅助组件：RAII Guard 与 共享状态
-// ==========================================
+// === 绑核函数 ===
+void pin_thread(int core_id) {
+#ifdef __linux__
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(core_id, &cpuset);
+    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+#endif
+}
+
+// === 核心测试逻辑 ===
 template <typename LockType>
-class Guard {
-    LockType& lock_;
-public:
-    explicit Guard(LockType& lock) : lock_(lock) { lock_.lock(); }
-    ~Guard() { lock_.unlock(); }
-    Guard(const Guard&) = delete;
-    Guard& operator=(const Guard&) = delete;
-};
+std::vector<uint64_t> run_latency_test(int thread_id, int num_threads, int iterations) {
+    // 注意：这里为了演示，我们将锁和状态设为全局或外部传入，这里简化为局部静态
+    // 实际测试中应确保多线程共享同一个 Lock 和 State
+    static LockType shared_lock;
+    static alignas(64) uint64_t shared_state = 0;
 
-struct alignas(64) SharedState {
-    int counter = 0;
-};
+    // 强制绑核：假设前两个核留给 OS，工作线程从 Core 2 开始绑定
+    pin_thread(thread_id + 2); 
 
-// ==========================================
-// 核心测试函数
-// ==========================================
-template <typename LockType>
-void run_benchmark(const std::string& name, int num_threads, int iterations) {
-    LockType lock;
-    SharedState state;
-    std::vector<std::thread> threads;
+    std::vector<uint64_t> latencies;
+    latencies.reserve(iterations);
 
-    auto worker = [&]() {
-        for (int i = 0; i < iterations; ++i) {
-            Guard<LockType> guard(lock);
-            state.counter++; // 极小临界区
-        }
-    };
+    for (int i = 0; i < iterations; ++i) {
+        auto start = std::chrono::high_resolution_clock::now();
+        
+        shared_lock.lock();
+        // 模拟极小的临界区业务逻辑
+        shared_state += 1; 
+        shared_lock.unlock();
 
-    auto start_time = std::chrono::high_resolution_clock::now();
-
-    for (int i = 0; i < num_threads; ++i) {
-        threads.emplace_back(worker);
+        auto end = std::chrono::high_resolution_clock::now();
+        latencies.push_back(std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
     }
-    for (auto& t : threads) {
-        t.join();
-    }
+    return latencies;
+}
 
-    auto end_time = std::chrono::high_resolution_clock::now();
-    auto duration_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time).count();
+void print_stats(const std::string& name, std::vector<uint64_t>& lats) {
+    std::sort(lats.begin(), lats.end());
+    uint64_t sum = std::accumulate(lats.begin(), lats.end(), 0ULL);
+    double avg = (double)sum / lats.size();
     
-    double avg_ns = (double)duration_ns / (num_threads * iterations);
-
     std::cout << "[" << name << "]\n";
-    std::cout << "  Total Ops: " << (num_threads * iterations) << "\n";
-    std::cout << "  Total Time: " << (duration_ns / 1000000.0) << " ms\n";
-    std::cout << "  Avg Time / Op: " << avg_ns << " ns\n";
-    std::cout << "  Final Counter: " << state.counter << "\n\n";
+    std::cout << "  Avg Latency : " << avg << " ns\n";
+    std::cout << "  P50 Latency : " << lats[lats.size() * 0.50] << " ns\n";
+    std::cout << "  P99 Latency : " << lats[lats.size() * 0.99] << " ns\n"; // HFT 最看重的指标
+    std::cout << "  P99.9 Latency: " << lats[lats.size() * 0.999] << " ns\n";
+    std::cout << "  Max Latency : " << lats.back() << " ns\n\n";
 }
 
 int main() {
-    const int NUM_THREADS = 4;         // 模拟 4 个交易线程激烈竞争
-    const int ITERATIONS = 2000000;    // 每个线程执行 200 万次
+    const int THREADS = 4;
+    const int ITERS = 100000; // 每个线程 10 万次
 
-    std::cout << "=== Lock Performance Benchmark ===\n";
-    std::cout << "Threads: " << NUM_THREADS << ", Iterations/Thread: " << ITERATIONS << "\n\n";
+    std::cout << "=== HFT vs Mutex Latency Test (Pinned) ===\n\n";
 
-    // 预热 CPU
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    // 测试 HFT Spinlock
+    std::vector<std::vector<uint64_t>> hft_results(THREADS);
+    std::vector<std::thread> hft_threads;
+    for(int i=0; i<THREADS; ++i) {
+        hft_threads.emplace_back([&](int id){ hft_results[id] = run_latency_test<HFTSpinlock>(id, THREADS, ITERS); }, i);
+    } 
+    for(auto& t : hft_threads) {
+        t.join();
+    }
+    
+    std::vector<uint64_t> all_hft_lats;
+    for(auto& v : hft_results) {
+        all_hft_lats.insert(all_hft_lats.end(), v.begin(), v.end());
+    }
+    print_stats("HFT Spinlock", all_hft_lats);
 
-    run_benchmark<HFTSpinlock>("1. Custom HFT Spinlock (TTAS + Pause)", NUM_THREADS, ITERATIONS);
-    run_benchmark<PthreadSpinlock>("2. OS Pthread Spinlock (TAS)", NUM_THREADS, ITERATIONS);
-    run_benchmark<StdMutexWrapper>("3. std::mutex (Futex / Context Switch)", NUM_THREADS, ITERATIONS);
+    // 测试 OS Spinlock
+    std::vector<std::vector<uint64_t>> os_results(THREADS);
+    std::vector<std::thread> os_threads;
+    for(int i=0; i<THREADS; ++i) {
+        os_threads.emplace_back([&](int id){ os_results[id] = run_latency_test<PthreadSpinlock>(id, THREADS, ITERS); }, i);
+    }
+    for(auto& t : os_threads) {
+        t.join();
+    }
+    std::vector<uint64_t> all_os_lats;
+    for(auto& v : os_results) {
+        all_os_lats.insert(all_os_lats.end(), v.begin(), v.end());
+    }
+    print_stats("OS Spinlock", all_os_lats);
+
+    // 测试 Mutex
+    std::vector<std::vector<uint64_t>> mtx_results(THREADS);
+    std::vector<std::thread> mtx_threads;
+    for(int i=0; i<THREADS; ++i) {
+        mtx_threads.emplace_back([&](int id){ mtx_results[id] = run_latency_test<StdMutexWrapper>(id, THREADS, ITERS); }, i);
+    }
+    for(auto& t : mtx_threads) {
+        t.join();
+    }
+    
+    std::vector<uint64_t> all_mtx_lats;
+    for(auto& v : mtx_results) {
+        all_mtx_lats.insert(all_mtx_lats.end(), v.begin(), v.end());
+    }
+    print_stats("std::mutex", all_mtx_lats);
 
     return 0;
 }
