@@ -27,10 +27,14 @@ void mat_mul_dot_product_avx2(const T* A, const T* B, T* C) {
    T* B_trans_ptr = B_trans.data();
    transpose<T, N, K>(B, B_trans_ptr);
    for (size_t m = 0; m < M; ++m) {
-      auto ymm_a = _mm256_loadu_ps(A + m * 256);
       for (size_t n = 0; n < N; ++n) {
-         auto ymm_b = _mm256_loadu_ps(B_trans_ptr + n * 256);
-         // TODO
+         auto ymm_c = _mm256_setzero_ps();
+         for (size_t k = 0; k < K; k += 8) {
+            auto ymm_a = _mm256_loadu_ps(A + m * K + k);
+            auto ymm_b = _mm256_loadu_ps(B_trans_ptr + n * K + k);
+            ymm_c = _mm256_fmadd_ps(ymm_a, ymm_b, ymm_c);
+         }
+         C[m * N + n] = hsum256_ps(ymm_c); 
       }
    }
 }
@@ -56,7 +60,7 @@ void mat_mul_dot_product_avx2(const T* A, const T* B, T* C) {
 
 int main() {
    const size_t M = 4;
-   const size_t N = 16;
+   const size_t N = 32;
    const size_t K = 8;
 
    std::vector<float> mat_A(M*K, 0.0F);
@@ -68,11 +72,11 @@ int main() {
 
    mat_mul_dot_product<float, M, N, K>(mat_A.data(), mat_B.data(), mat_C.data());
 
-   std::cout << mat_C[0] << ", " << mat_C[1] << "\n";
+   std::cout << mat_C[0] << ", " << mat_C[1] << " ... " << mat_C[30] << ", " << mat_C[31] << "\n";
 
    std::vector<float> mat_C2(M*N, 0.0F);
-   mat_mul_dot_product<float, M, N, K>(mat_A.data(), mat_B.data(), mat_C2.data());
-   std::cout << mat_C2[0] << ", " << mat_C2[1] << "\n";
+   mat_mul_dot_product_avx2<float, M, N, K>(mat_A.data(), mat_B.data(), mat_C2.data());
+   std::cout << mat_C2[0] << ", " << mat_C2[1] << " ... " << mat_C2[30] << ", " << mat_C2[31] << "\n";
 
    return 0;
 }
