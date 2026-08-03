@@ -6,7 +6,6 @@
 namespace pooling {
 
 enum class pooling_kind { max, avg_include_padding, avg_exclude_padding };
-enum class post_op_kind { none, relu, clamp, scale_bias };
 
 struct pooling2d_desc {
     int n;
@@ -22,11 +21,6 @@ struct pooling2d_desc {
     int pad_t;
     int pad_l;
     pooling_kind kind;
-    post_op_kind post_op {post_op_kind::none};
-    float post_op_scale {1.0F};
-    float post_op_bias {0.0F};
-    float post_op_min {0.0F};
-    float post_op_max {0.0F};
     int threads {0};
 };
 
@@ -41,7 +35,7 @@ int main() {
     using namespace pooling;
     const pooling2d_desc base {
             2, 13, 5, 7, 3, 4, 3, 3, 2, 2, 1, 1,
-            pooling_kind::max, post_op_kind::clamp, 1.0F, 0.0F, -0.25F, 0.75F, 3};
+            pooling_kind::max, 3};
     const std::size_t src_size = static_cast<std::size_t>(base.n) * base.c * base.ih * base.iw;
     const std::size_t dst_size = static_cast<std::size_t>(base.n) * base.c * base.oh * base.ow;
     std::vector<float> src(src_size);
