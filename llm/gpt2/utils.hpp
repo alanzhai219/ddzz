@@ -11,13 +11,32 @@ struct JsonParser {
     // parse string
     std::string parse_string() {
         skip_whitespace();
-        ensure_at('\"');
+        if (!ensure_at('\"')) {
+            throw std::runtime_error("no string");
+        }
         advance();
 
-        while() {
-            
+        std::string out_str;
+        while(ensure_at('\"') && !at_end()) {
+            out_str.push_back(m_json[m_cursor]);
+            ++m_cursor;
         }
+        ++m_cursor;
+        return out_str;
     }
+
+    // parse number
+    double parse_number() {
+        skip_whitespace();
+
+        size_t begin = m_cursor;
+        while(is_number_char(m_json[m_cursor]) && !at_end()) {
+            ++m_cursor;
+        }
+        double ret_val = std::stod(m_json.substr(begin, m_cursor - begin));
+        return ret_val;
+    }
+    // parse list
 
     // skip whitespace char
     void skip_whitespace() {
@@ -44,13 +63,8 @@ private:
         return m_cursor == m_json.size();
     }
 
-    void ensure_at(const char* expected) {
-        if (at_end() || m_json[m_cursor] != expected[0]) {
-            std::string msg = "safetensors header: expected '";
-            msg += expected;
-            msg += "';";
-            throw std::runtime_error(msg);
-        }
+    bool ensure_at(const char* expected) {
+        return (m_json[m_cursor] == expected[0] && !at_end();
     }
 
     const std::string& m_json;
