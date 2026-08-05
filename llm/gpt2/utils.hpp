@@ -18,6 +18,9 @@ struct JsonParser {
 
         std::string out_str;
         while(ensure_at('\"') && !at_end()) {
+            if (ensure_at('\\')) {
+                ++m_cursor
+            }
             out_str.push_back(m_json[m_cursor]);
             ++m_cursor;
         }
@@ -29,14 +32,38 @@ struct JsonParser {
     double parse_number() {
         skip_whitespace();
 
-        size_t begin = m_cursor;
+        size_t start = m_cursor;
         while(is_number_char(m_json[m_cursor]) && !at_end()) {
             ++m_cursor;
         }
-        double ret_val = std::stod(m_json.substr(begin, m_cursor - begin));
+        double ret_val = std::stod(m_json.substr(start, m_cursor - start));
         return ret_val;
     }
+
     // parse list
+    std::vector<size_t> parse_array() {
+        std::vector<size_t> ret_vec;
+
+        skip_whitespace();
+        if (!ensure_at('[')) {
+            throw std::runtime_error("no array");
+        }
+        ++m_cursor;
+        skip_whitespace();
+
+        while(is_number_char(m_json[m_cursor]) && !at_end()) {
+            ret_vec.push_back(static_cast<size_t>(parser_number()));
+
+            skip_whitespace();
+            ++m_cursor;
+
+            if (m_json[m_cursor] == ',') {
+                ++m_cursor;
+                skip_whitespace();
+            }
+        }
+        ++m_cursor;
+    }
 
     // skip whitespace char
     void skip_whitespace() {
