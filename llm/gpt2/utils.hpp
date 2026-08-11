@@ -1,10 +1,18 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 namespace gpt2 {
 namespace utils {
 
+size_t numel(const std::vector<size_t>& shape) {
+    size_t num = 1;
+    for (auto v : shape) {
+        num *= v;
+    }
+    return num;
+}
 struct JsonParser {
     JsonParser(const std::string& json_file) : m_json(json_file), m_cursor(0) {}
 

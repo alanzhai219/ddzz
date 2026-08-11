@@ -1,7 +1,9 @@
 #pragma once
 
 #include <cstddef>
+#include <cassert>
 #include <vector>
+#include <string>
 namespace gpt2 {
 
 struct Tensor {
@@ -32,6 +34,54 @@ struct Tensor {
         compute_strides();
     }
 
+    // access raw data
+    const std::vector<float>& data() const {
+        return m_data;
+    }
+
+    float* ptr() {
+        return m_data.data();
+    }
+
+    // access shape
+    const std::vector<size_t>& stride() const {
+        return m_stride;
+    }
+
+    const std::vector<size_t>& shape() const {
+        return m_shape;
+    }
+
+    size_t ndims() const {
+        return m_shape.size();
+    }
+
+    size_t dim(size_t idx) const {
+        assert(idx < m_shape.size());
+        return m_shape[idx];
+    }
+
+    std::string shape_str() const {
+        std::string str = "[";
+        for (size_t i = 0; i < m_shape.size(); ++i) {
+            str += std::to_string(m_shape[i]);
+            if (i != m_shape.size() - 1) {
+                str += ",";
+            }
+        }
+        str += "]";
+        return str;
+    }
+
+    size_t numel() const {
+        size_t num = 1;
+        for (auto v : m_shape) {
+            num *= v;
+        }
+        return num;
+    }
+
+    // access tensor data by index
     float at(size_t i, size_t j, size_t k, size_t l) {
         const size_t offset = i * m_stride[0] + j * m_stride[1] + k * m_stride[2] + l * m_stride[3];
         return m_data[offset];
