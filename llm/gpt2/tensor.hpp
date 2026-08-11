@@ -1,13 +1,17 @@
 #pragma once
 
+#include <cstddef>
 #include <vector>
-
 namespace gpt2 {
 
 struct Tensor {
     Tensor()  = default;
-    Tensor(std::vector<size_t> shape, std::vector<float> value);
-    Tensor(std::vector<size_t> shape, float fill = 0.0F);
+    Tensor(const std::vector<size_t>& shape, const std::vector<float>& value);
+    Tensor(const std::vector<size_t>& shape, float fill = 0.0F);
+    Tensor(const Tensor&);
+    Tensor(Tensor&&);
+    Tensor& operator=(const Tensor&);
+    Tensor& operator=(Tensor&&);
     
     virtual ~Tensor() = default;
     
@@ -18,15 +22,46 @@ struct Tensor {
         m_stride.resize(m_shape.size()); 
         m_stride.back() = 1;
         for (size_t idx = m_shape.size() - 1; idx > 0; --idx) {
-            // TODO
+            m_stride[idx - 1] = m_stride[idx] * m_shape[idx];
         }
     }
 
+    void reshape(const std::vector<size_t>& shape) {
+        assert(numel(shape) == m_data.size());
+        m_shape = shape;
+        compute_strides();
+    }
 
+    float at(size_t i, size_t j, size_t k, size_t l) {
+        const size_t offset = i * m_stride[0] + j * m_stride[1] + k * m_stride[2] + l * m_stride[3];
+        return m_data[offset];
+    }
+
+    float at(size_t i, size_t j, size_t k) {
+        const size_t offset = i * m_stride[0] + j * m_stride[1] + k * m_stride[2];
+        return m_data[offset];
+    }
+
+    float at(size_t i, size_t j) {
+        const size_t offset = i * m_stride[0] + j * m_stride[1];
+        return m_data[offset];
+    }
+
+    float at(size_t i, size_t j, size_t k, size_t l) const {
+        return at(i, j, k, l);
+    }
+
+    float at(size_t i, size_t j, size_t k) const {
+        return at(i, j, k);
+    }
+
+    float at(size_t i, size_t j) const {
+        return at(i, j);
+    }
 
 private:
   std::vector<float>  m_data;
   std::vector<size_t> m_shape;
   std::vector<size_t> m_stride;
 };
-};
+} // namespace gpt2
