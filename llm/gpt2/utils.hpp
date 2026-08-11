@@ -2,6 +2,7 @@
 
 #include <string>
 #include <vector>
+#include <stdexcept>
 
 namespace gpt2 {
 namespace utils {
@@ -25,9 +26,9 @@ struct JsonParser {
         advance();
 
         std::string out_str;
-        while(ensure_at('\"') && !at_end()) {
+        while(!ensure_at('\"') && !at_end()) {
             if (ensure_at('\\')) {
-                ++m_cursor
+                ++m_cursor;
             }
             out_str.push_back(m_json[m_cursor]);
             ++m_cursor;
