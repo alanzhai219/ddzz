@@ -81,9 +81,34 @@ struct JsonParser {
         }
     }
 
+    // skip arbitrary value
+    // only parse specified values.
+    // use skip_value to skip unused values.
+    void skip_value() {
+        skip_whitespace();
+        if (at_end()) {
+            return;
+        }
+
+        switch (text_[cursor_]) {
+            case '{': skip_balanced('{', '}'); break;
+            case '[': skip_balanced('[', ']'); break;
+            case '"': parse_string();          break;
+            default:  parse_number();          break;
+        }
+    }
+
     // go ahead
     void advance() {
         ++m_cursor;
+    }
+
+    std::string buffer() {
+        return m_json;
+    }
+
+    size_t cursor() {
+        return m_cursor;
     }
 
 private:
@@ -101,6 +126,20 @@ private:
 
     bool ensure_at(const char* expected) {
         return (m_json[m_cursor] == expected[0] && !at_end();
+    }
+
+    // -------------------------------------------------------------------------
+    // Skip a balanced pair of brackets ({} or []) including nested content.
+    // Caller must ensure cursor_ points to the opening bracket.
+    // -------------------------------------------------------------------------
+    void skip_balanced(char open, char close) {
+        int depth = 1;
+        advance();                           // consume opening bracket
+        while (cursor_ < text_.size() && depth > 0) {
+            if (text_[cursor_] == open)  ++depth;
+            if (text_[cursor_] == close) --depth;
+            advance();
+        }
     }
 
     const std::string& m_json;
