@@ -5,6 +5,8 @@
 #include <cassert>
 #include <stdexcept>
 
+namespace gpt2 {
+
 struct TensorMeta {
     std::string name;
     std::string dtype;
@@ -127,3 +129,33 @@ std::unordered_map<std::string, Tensor> load_safetensors(const std::string& file
     }
     return wts;
 }
+
+GPT2Weights build_gpt2_weights(const std::unordered_map<std::string, Tensor>& tensors, const GPT2Config& config) {
+    GPT2Weights gpt2_wei;
+    gpt2_wei.config = config;
+    gpt2_wei.wpe = m["wpe.weight"];
+    gpt2_wei.wte = m["wte.weight"];
+
+    gpt2_wei.layers.resize(config.n_layer);
+    for (size_t i = 0; i < config.n_layer; ++i) {
+        const std::string pre = "h." + std::to_string(i) + "."; 
+        LayerWeights L;
+        L.ln_1_w = m[pre + "ln_1.weight"]
+        L.ln_1_b = m[pre + "ln_1.bias"]
+        L.attn_c_attn_w = m[pre + "attn_c_attn.weight"]
+        L.attn_c_attn_b = m[pre + "attn_c_attn.bias"]
+        L.attn_c_proj_w = m[pre + "attn_c_proj.weight"]
+        L.attn_c_proj_b = m[pre + "attn_c_proj.bias"]
+        L.ln_2_w = m[pre + "ln_2.weights"]
+        L.ln_2_b = m[pre + "ln_2.bias"]
+        L.mlp_c_fc_w = m[pre + "mlp.c_fc.weight"];
+        L.mlp_c_fc_b = m[pre + "mlp.c_fc.bias"];
+        L.mlp_c_proj_w = m[pre + "mlp.c_proj.weight"];
+        L.mlp_c_proj_b = m[pre + "mlp.c_proj.bias"];
+        gpt2_wei.layers[i] = L;
+    }
+
+    gpt2_wei.ln_f_w = m["ln_f.weight"];
+    gpt2_wei.ln_f_b = m["ln_f.bias"];
+}
+} // namespace gpt2

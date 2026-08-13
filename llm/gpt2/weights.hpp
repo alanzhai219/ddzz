@@ -25,8 +25,8 @@ struct LayerWeights {
 
 struct GPT2Weights {
     GPT2Config config;
-    Tensor wte;     // [n_vocab, n_embd] word embedding
     Tensor wpe;     // [max_position_embeddings, n_embd] position embedding
+    Tensor wte;     // [n_vocab, n_embd] word embedding
     std::vector<LayerWeights> layers;
     Tensor ln_f_w;  // [n_embd] final layer norm weight
     Tensor ln_f_b;  // [n_embd] final layer norm bias
