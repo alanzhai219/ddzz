@@ -9,7 +9,7 @@ struct GPT2Config {
     size_t n_embd        = 768;   // 768
     size_t n_layer       = 12;    // 12
     size_t n_head        = 12;    // 12
-    size_t max_pos_embed = 1024;  // 1024
+    size_t n_positions   = 1024;  // 1024
 };
 
 } // namespace gpt2

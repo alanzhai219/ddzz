@@ -1,0 +1,21 @@
+#pragma once
+
+#include <vector>
+
+#include "tensor.hpp"
+
+namespace gpt2 {
+namespace ops {
+
+/*
+ *  wte: [vocab_size, n_embed]
+*/
+Tensor token_embed(const Tensor& wte, const std::vector<int>& ids);
+
+/*
+ *  wpt: [n_positions, n_embed]
+ * */
+Tensor position_embed(const Tensor& wpe, size_t start, size_t S);
+
+}
+}
