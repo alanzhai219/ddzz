@@ -17,5 +17,7 @@ Tensor token_embed(const Tensor& wte, const std::vector<int>& ids);
  * */
 Tensor position_embed(const Tensor& wpe, size_t start, size_t S);
 
+Tensor add(const Tensor& a, const Tensor& b);
+
 }
 }

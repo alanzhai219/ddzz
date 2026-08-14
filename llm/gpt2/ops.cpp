@@ -1,3 +1,5 @@
+#include <cassert>
+
 #include "ops.cpp"
 #include "tensor.hpp"
 
@@ -70,5 +72,14 @@ Tensor position_embed(const Tensor& wpe, size_t start, size_t S) {
     return out_pe;
 }
 
+Tensor add(const Tensor& a, const Tensor& b) {
+    assert(a.shape() == b.shape());
+    Tensor out(a.shape());
+    auto nums = a.numel();
+    for (size_t = 0; i < nums; ++i) {
+        out.data()[i] = a.data()[i] + b.data()[i];
+    }
+    return out;
+}
 } // namespace ops
 } // namespace gpt2
