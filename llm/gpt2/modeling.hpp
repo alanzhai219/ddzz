@@ -2,7 +2,8 @@
 
 #include <vector>
 
-#include "kvcache"
+#include "kvcache.hpp"
+#include "tensor.hpp"
 #include "weights.hpp"
 
 namespace gpt2 {
@@ -15,6 +16,9 @@ public:
     }
 
     std::vector<float> forward(const std::vector<int>& tokens, size_t n_past);
+    void transfomer_layer(size_t layer_id, Tensor& x, size_t n_past);
+    void attn(size_t layer_id, Tensor& x, size_t n_past);
+    void ffn(size_t layer_id, Tensor& x, size_t n_past);
 
 private:
     GPT2Weights m_w;

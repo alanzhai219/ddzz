@@ -19,5 +19,10 @@ Tensor position_embed(const Tensor& wpe, size_t start, size_t S);
 
 Tensor add(const Tensor& a, const Tensor& b);
 
+Tensor layer_norm(const Tensor& x, const Tensor& gamma, const Tensor& beta, float eps = 1e-5);
+
+Tensor matmul_2d(const Tensor& a, const Tensor& b);
+}
+
 }
 }
