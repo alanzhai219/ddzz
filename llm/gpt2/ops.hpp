@@ -23,6 +23,8 @@ Tensor layer_norm(const Tensor& x, const Tensor& gamma, const Tensor& beta, floa
 
 Tensor matmul_2d(const Tensor& a, const Tensor& b);
 
+void split_qkv(const Tensor& qkv, Tensor& q, Tensor& k, Tensor& v);
+
 Tensor split_head(const Tensor& x, size_t S, size_t n_head, size_t head_dim);
 
 Tensor merge_head(const Tensor& x);

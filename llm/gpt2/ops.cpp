@@ -157,6 +157,25 @@ Tensor matmul_2d(const Tensor& a, const Tensor& b) {
     return out;
 }
 
+
+// [S, 3*n_embd] => [S, n_embd], [S, n_embd], [S, n_embd]
+void split_qkv(const Tensor& qkv, Tensor& q, Tensor& k, Tensor& v) {
+    const auto qkv_shape = qkv.shape();
+    const size_t S = qkv_shape[0];
+    const size_t n_embd = qkv_shape[1] / 3;
+
+    const float* qkv_ptr = qkv.ptr();
+    float* q_ptr = q.ptr();
+    float* k_ptr = k.ptr();
+    float* v_ptr = v.ptr();
+
+    for (size_t s = 0; s < S; ++s) {
+        std::memcpy(q_ptr + s * n_embd, qkv_ptr + s * 3 * n_embd, sizeof(float) * n_embd);
+        std::memcpy(k_ptr + s * n_embd, qkv_ptr + s * 3 * n_embd + n_embd, sizeof(float) * n_embd);
+        std::memcpy(v_ptr + s * n_embd, qkv_ptr + s * 3 * n_embd + 2 * n_embd, sizeof(float) * n_embd);
+    }
+}
+
 /*
  *  token major => head major
  *  [S, n_embd] => [n_head, S, head_dim]
