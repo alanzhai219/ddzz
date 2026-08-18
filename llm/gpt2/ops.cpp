@@ -156,5 +156,69 @@ Tensor matmul_2d(const Tensor& a, const Tensor& b) {
     }
     return out;
 }
+
+/*
+ *  token major => head major
+ *  [S, n_embd] => [n_head, S, head_dim]
+ *
+ *  token0: | head 0 | head 1 | ... | head n-1 |
+ *  token1: | head 0 | head 1 | ... | head n-1 |
+ *  token2: | head 0 | head 1 | ... | head n-1 |
+ *  token3: | head 0 | head 1 | ... | head n-1 |
+ *
+ *  =>
+ *  head 0:     | token0 |
+ *              | token1 |
+ *              | token2 |
+ *              | token3 |
+ *  head 1:     | token0 |
+ *              | token1 |
+ *              | token2 |
+ *              | token3 |
+ *  ...         ...
+ *  head n-1:   | token0 |
+ *              | token1 |
+ *              | token2 |
+ *              | token3 |
+ */
+Tensor split_head(const Tensor& x, size_t S, size_t n_head, size_t head_dim) {
+    const auto in_shape = x.shape();
+    assert(in_shape[0] == S);
+    assert(in_shape[1] == n_head * head_dim);
+    Tensor out({n_head, S, head_dim});
+    const float* in_ptr = x.ptr();
+    float* out_ptr = out.ptr();
+    for (size_t h = 0; h < n_head; ++h) {
+        for (size_t s = 0; s < S; ++s) {
+            std::memcpy(out_ptr + h * S * head_dim + s * head_dim, in_ptr + s * n_head * head_dim + h + head_dim, sizeof(float) * head_dim);; 
+        }
+    }
+    return out;
+}
+
+// [n_heads, S, head_dim] => [S, n_heads * head_dim] => [S, n_embd]
+Tensor merge_head(const Tensor& x) {
+    const auto in_shape = x.shape();
+    const size_t n_heads = in_shape[0];
+    const size_t S = in_shape[1];
+    const size_t head_dim = in_shape[2];
+    size_t n_embd = n_heads * head_dim;
+
+    Tensor out({S, n_embd});
+
+    const float* in_ptr = in.ptr(); 
+    float* out_ptr = out.ptr();
+    
+    for (size_t s = 0; s < S; ++s) {
+        for (size_t h = 0; h < n_heads; ++h) {
+            std::memcpy(
+                    out_ptr + s * n_embd + h * head_dim,
+                    in_ptr + h * S * head_dim + s * head_dim,
+                    sizeof(float) * head_dim
+                    );
+        }
+    }
+    return out;
+}
 } // namespace ops
 } // namespace gpt2
