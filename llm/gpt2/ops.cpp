@@ -239,5 +239,38 @@ Tensor merge_head(const Tensor& x) {
     }
     return out;
 }
+
+Tensor softmax(const Tensor& x) {
+    const auto shape = x.shape();
+    const size_t last_dim = x.dims() - 1;
+    const size_t row = x.shape()[last_dim];
+    const size_t N = x.size() / row;
+
+    Tensor out(shape);
+    const float* in_ptr = x.ptr();
+    float* out_ptr = out.ptr();
+
+    for (size_t i = 0; i < N; ++i) {
+        float* src = in_ptr + i * row;
+        float* dst = out_ptr + i * row;
+        float max_val = 0.0F;
+        for (size_t j = 0; j < row; ++j) {
+            max_val = std::max(max_val, src + j);
+        }
+
+        float sum = 0.0F;
+        for (size_t j = 0; j < row; ++j) {
+            dst[j] = std::exp(src[j] - max_val);
+            sum += dst[j];
+        }
+
+        float sum_div = 1 / sum;
+        for (size_t j = 0; j < row; ++j) {
+            dst[j] *= sum_div;
+        }
+    }
+
+    return out;
+}
 } // namespace ops
 } // namespace gpt2
