@@ -200,16 +200,12 @@ void split_qkv(const Tensor& qkv, Tensor& q, Tensor& k, Tensor& v) {
  *              | token2 |
  *              | token3 |
  */
-Tensor split_head(const Tensor& x, size_t S, size_t n_head, size_t head_dim) {
-    const auto in_shape = x.shape();
-    assert(in_shape[0] == S);
-    assert(in_shape[1] == n_head * head_dim);
+Tensor split_head(const float* x_ptr, size_t S, size_t n_head, size_t head_dim) {
     Tensor out({n_head, S, head_dim});
-    const float* in_ptr = x.ptr();
     float* out_ptr = out.ptr();
     for (size_t h = 0; h < n_head; ++h) {
         for (size_t s = 0; s < S; ++s) {
-            std::memcpy(out_ptr + h * S * head_dim + s * head_dim, in_ptr + s * n_head * head_dim + h + head_dim, sizeof(float) * head_dim);; 
+            std::memcpy(out_ptr + h * S * head_dim + s * head_dim, x_ptr + s * n_head * head_dim + h + head_dim, sizeof(float) * head_dim);; 
         }
     }
     return out;
