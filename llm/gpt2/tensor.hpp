@@ -43,6 +43,22 @@ struct Tensor {
         return m_data.data();
     }
 
+    // access tensor data by index
+    float* ptr(size_t i, size_t j, size_t k, size_t l) {
+        const size_t offset = i * m_stride[0] + j * m_stride[1] + k * m_stride[2] + l * m_stride[3];
+        return &m_data[offset];
+    }
+
+    float* ptr(size_t i, size_t j, size_t k) {
+        const size_t offset = i * m_stride[0] + j * m_stride[1] + k * m_stride[2];
+        return &m_data[offset];
+    }
+
+    float* ptr(size_t i, size_t j) {
+        const size_t offset = i * m_stride[0] + j * m_stride[1];
+        return &m_data[offset];
+    }
+
     // access shape
     const std::vector<size_t>& stride() const {
         return m_stride;

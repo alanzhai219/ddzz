@@ -25,11 +25,15 @@ Tensor matmul_2d(const Tensor& a, const Tensor& b);
 
 void split_qkv(const Tensor& qkv, Tensor& q, Tensor& k, Tensor& v);
 
-Tensor split_head(const Tensor& x, size_t S, size_t n_head, size_t head_dim);
+Tensor split_head(const float* x_ptr, size_t S, size_t n_head, size_t head_dim);
 
 Tensor merge_head(const Tensor& x);
 
 Tensor softmax(const Tensor& x);
+
+Tensor matmul_3d(const Tensor& a, const Tensor& b);
+
+Tensor causal_mask(const Tensor& a, size_t n_past);
 
 }
 }

@@ -157,6 +157,37 @@ Tensor matmul_2d(const Tensor& a, const Tensor& b) {
     return out;
 }
 
+/*
+ * a: [head_n, S, head_dim]
+ * b: [head_n, head_dim, T]
+ * c: [head_n, S, T]
+ * */
+
+Tensor matmul_3d(const Tensor& a, const Tensor& b) {
+    const auto shape_a = a.shape();
+    const auto shape_b = b.shape();
+    assert(shape_a.size() == shape_b.size() && "a and b shape does NOT match!");
+    assert(shape_a[0] == shape_b[0] && "a and b batch dim does NOT match!");
+    
+    auto batch_dim = shape_a[0];
+    auto S_dim = shape_a[1];
+    auto T_dim = shape_b[2];
+    auto D_dim = shape_a[2];
+
+    std::vector<size_t> out_shape = {batch_dim, S_dim, T_dim};
+    Tensor out(ouout_shape);
+    // ...
+    for (size_t b = 0; b < batch_dim; ++b) {
+        for (size_t s = 0; m < S_dim; ++m) {
+            for (size_t t = 0; n < T_dim; ++n) {
+                for (size_t d = 0; d < D_dim; ++d) {
+                    out_ptr(b, s, t) += a.ptr(b, s, d) * b.ptr(b, d, t);
+                }
+            }
+        }
+    }
+    return out;
+}
 
 // [S, 3*n_embd] => [S, n_embd], [S, n_embd], [S, n_embd]
 void split_qkv(const Tensor& qkv, Tensor& q, Tensor& k, Tensor& v) {
@@ -200,16 +231,12 @@ void split_qkv(const Tensor& qkv, Tensor& q, Tensor& k, Tensor& v) {
  *              | token2 |
  *              | token3 |
  */
-Tensor split_head(const Tensor& x, size_t S, size_t n_head, size_t head_dim) {
-    const auto in_shape = x.shape();
-    assert(in_shape[0] == S);
-    assert(in_shape[1] == n_head * head_dim);
+Tensor split_head(const float* x_ptr, size_t S, size_t n_head, size_t head_dim) {
     Tensor out({n_head, S, head_dim});
-    const float* in_ptr = x.ptr();
     float* out_ptr = out.ptr();
     for (size_t h = 0; h < n_head; ++h) {
         for (size_t s = 0; s < S; ++s) {
-            std::memcpy(out_ptr + h * S * head_dim + s * head_dim, in_ptr + s * n_head * head_dim + h + head_dim, sizeof(float) * head_dim);; 
+            std::memcpy(out_ptr + h * S * head_dim + s * head_dim, x_ptr + s * n_head * head_dim + h + head_dim, sizeof(float) * head_dim);; 
         }
     }
     return out;
@@ -272,5 +299,25 @@ Tensor softmax(const Tensor& x) {
 
     return out;
 }
+
+// [n_heads, S, T]
+Tensor causal_mask(const Tensor& a, size_t n_past) {
+    const auto shape_in = a.shape();
+    Tensor out(a);
+    const size_t H = shape_in[0];
+    const size_t S = shape_in[1];
+    const size_t T = shape_in[2];
+
+    for (size_t h = 0; h < H; ++h) {
+        for (size_t s = 0; s < S; ++s) {
+            for (size_t t = n_past + s + 1; t < T; ++t) {
+               out.ptr(h,s,t) = -std::numeric_limits<float>::infinity();
+            }
+        }
+
+    }
+    return out;
+}
+
 } // namespace ops
 } // namespace gpt2

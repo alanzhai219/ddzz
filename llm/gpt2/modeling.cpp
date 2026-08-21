@@ -58,8 +58,11 @@ void GPT2::attn(size_t layer_id, Tensor& x, size_t n_past) {
     vc.insert(vc.end(), v.ptr(), v_ptr() + v.size());
 
     // [S, e_embd] => [n_head, S, head_dim]
-    Tensor Q = split_head(q, S, n_head, head_dim);
+    Tensor Q = ops::split_head(q, S, n_head, head_dim);
+    Tensor K = ops::split_head(kc.data(), total, n_head, head_dim);
+    Tensor V = ops::split_head(vc.data(), total, n_head, head_dim);
     // ...
+    Tensor score = 
 }
 
 void GPT2::ffn(size_t layer_id, Tensor& x, size_t n_past) {
