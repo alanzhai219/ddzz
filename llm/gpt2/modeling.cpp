@@ -62,7 +62,14 @@ void GPT2::attn(size_t layer_id, Tensor& x, size_t n_past) {
     Tensor K = ops::split_head(kc.data(), total, n_head, head_dim);
     Tensor V = ops::split_head(vc.data(), total, n_head, head_dim);
     // ...
-    Tensor score = 
+    Tensor score = ops::matmul_3d(Q, K);   // Q[n_head, S, head_dim] * K[n_head, T, head_dim] => score [n_head, S, T]
+    Tensor score_scale = ops::scale(score, m_scale); // []
+    Tensor score_causal = ops::causal_mask(score_scale, n_past); // [n_head, S, T]
+    Tensor socre_softmax = ops::softmax(score_causal);
+    // TODO:: adding a transpose op. The matmul_3d cannot support the below layout
+    Tensor score_out = ops::matmul_3d(score_softmax, V); // [n_head, S, T] * [n_head, T, head_dim] => [n_head, S, head_dim]
+    Tensor attn_out = ops::merge_head(score_out); // [S, em_bd]
+    
 }
 
 void GPT2::ffn(size_t layer_id, Tensor& x, size_t n_past) {

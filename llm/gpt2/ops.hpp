@@ -35,5 +35,7 @@ Tensor matmul_3d(const Tensor& a, const Tensor& b);
 
 Tensor causal_mask(const Tensor& a, size_t n_past);
 
+Tensor scale(const Tensor& x, const float s);
+
 }
 }

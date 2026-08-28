@@ -319,5 +319,14 @@ Tensor causal_mask(const Tensor& a, size_t n_past) {
     return out;
 }
 
+Tensor scale(const Tensor& x, const float s) {
+    Tensor out(x);
+    auto vals = out.data();
+    for (auto& v : vals) {
+        v *= s;
+    }
+    return out;
+}
+
 } // namespace ops
 } // namespace gpt2
