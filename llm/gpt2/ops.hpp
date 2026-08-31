@@ -37,5 +37,8 @@ Tensor causal_mask(const Tensor& a, size_t n_past);
 
 Tensor scale(const Tensor& x, const float s);
 
+Tensor transpose_2d(const Tensor& x);
+Tensor transpose_3d(const Tensor& x);
+
 }
 }

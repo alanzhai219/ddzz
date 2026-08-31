@@ -328,5 +328,44 @@ Tensor scale(const Tensor& x, const float s) {
     return out;
 }
 
+/*
+ * [..., Y, Z] => [..., Z, Y]
+ */
+
+Tensor transpose_2d(const Tensor& x) {
+    const auto shape_in = x.shape(); 
+    auto shape_out = shape_in;
+    shape_out[-1] = shape_in[-2];
+    shape_out[-2] = shape_in[-1];
+    Tensor out(shape_out);
+    auto D0 = shape_out[0];
+    auto D1 = shape_out[1];
+    for (size_t d0 = 0; d0 < D0; ++d0) {
+        for (size_t d1 = 0; d1 < D1; ++d1) {
+            out.ptr(d0, d1) = in.ptr(d1, d0);
+        }
+    }
+    return out;
+}
+
+Tensor transpose_3d(const Tensor& x) {
+    const auto shape_in = x.shape(); 
+    auto shape_out = shape_in;
+    shape_out[-1] = shape_in[-2];
+    shape_out[-2] = shape_in[-1];
+    Tensor out(shape_out);
+    auto D0 = shape_out[0];
+    auto D1 = shape_out[1];
+    auto D2 = shape_out[2];
+    for (size_t d0 = 0; d0 < D0; ++d0) {
+        for (size_t d1 = 0; d1 < D1; ++d1) {
+            for (size_t d2 = 0; d2 < D2; ++d2) {
+                out.ptr(d0, d1, d2) = in.ptr(d0, d2, d1);
+            }
+        }
+    }
+    return out;
+}
+
 } // namespace ops
 } // namespace gpt2
