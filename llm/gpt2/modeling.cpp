@@ -40,7 +40,7 @@ void GPT2::attn(size_t layer_id, Tensor& x, size_t n_past) {
     // layer_norm
     x = ops::layer_norm(x, lw.ln_1_w, lw.ln_1_b);   // [S, em_bd]
     Tensor qkv = ops::matmul_2d(x, lw.attn_c_attn_w);        // [S, 3*em_bd]
-    qkv = ops::add(qkv, lw.attn_c_attn_b);              // [S, 3*em_bd]
+    ops::add_(qkv, lw.attn_c_attn_b);              // [S, 3*em_bd]
 
     // sdpa
     // split qkv
@@ -59,21 +59,46 @@ void GPT2::attn(size_t layer_id, Tensor& x, size_t n_past) {
 
     // [S, e_embd] => [n_head, S, head_dim]
     Tensor Q = ops::split_head(q, S, n_head, head_dim);
+    // [T, embed] => [n_head, T, head_dim]
     Tensor K = ops::split_head(kc.data(), total, n_head, head_dim);
     Tensor V = ops::split_head(vc.data(), total, n_head, head_dim);
-    // ...
-    Tensor score = ops::matmul_3d(Q, K);   // Q[n_head, S, head_dim] * K[n_head, T, head_dim] => score [n_head, S, T]
+
+    // Q[n_head, S, head_dim] * K[n_head, T, head_dim] => score [n_head, S, T]
+    Tensor score = ops::matmul_3d(Q, ops::transpose_3d(K));
     Tensor score_scale = ops::scale(score, m_scale); // []
     Tensor score_causal = ops::causal_mask(score_scale, n_past); // [n_head, S, T]
     Tensor socre_softmax = ops::softmax(score_causal);
-    // TODO:: adding a transpose op. The matmul_3d cannot support the below layout
-    Tensor score_out = ops::matmul_3d(score_softmax, V); // [n_head, S, T] * [n_head, T, head_dim] => [n_head, S, head_dim]
-    Tensor attn_out = ops::merge_head(score_out); // [S, em_bd]
+    // [n_head, S, T] * [n_head, T, head_dim] => [n_head, S, head_dim]
+    Tensor score_out = ops::matmul_3d(score_softmax, V);
+    // [n_head, S, head_dim] => [S, em_bd]
+    Tensor attn_out = ops::merge_head(score_out);
+
+    // [S, em_bd] * [em_bd, * em_bd] => [S, em_bd]
+    Tensor proj = ops::matmul_2d(attn_out, lw.attn_c_proj_w);
+    ops::add_(proj, lw.attn_c_proj_b);
     
+    // residule connect
+    ops::add_(x, proj_out);
 }
 
-void GPT2::ffn(size_t layer_id, Tensor& x, size_t n_past) {
+void GPT2::mlp(size_t layer_id, Tensor& x, size_t n_past) {
     const LayerWeights& lw = m_w.layers[layer_id];
+    // [S, em_bd]
+    Tensor ln2 = ops::layer_norm(x, lw.ln_2_w, lw.ln_2_b);
+
+    // [S, em_bd] * [n_embd, 4 x n_head] => [S, 4 x n_head]
+    Tensor hh = ops::matmul_2d(ln2, lw.mlp_c_fc_w);
+    ops::add_(hh, lw_mlp_c_fc_b);
+
+    // GELU
+    ops::gelu_(hh);
+    
+    // [S, 4 x n_head] * [4 * n_embd, n_embd] => [S, n_embd] 
+    Tensor mlp_down = ops::matmul_2d(hh, lw.mlp_c_proj_w);
+    ops::add_(mlp_down, lw.mlp_c_proj_b);
+
+    //
+    ops::add_(x, mlp_down);
 }
 
 }

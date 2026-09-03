@@ -83,6 +83,15 @@ Tensor add(const Tensor& a, const Tensor& b) {
     return out;
 }
 
+void add_(Tensor& a, const Tensor& b) {
+    assert(a.shape() == b.shape());
+    auto nums = a.numel();
+    float* a_ptr = a.ptr();
+    const float* b_ptr = b.ptr();
+    for (size_t = 0; i < nums; ++i) {
+        a_ptr[i] += b_ptr[i];
+    }
+}
 /*
  * x: [S, N]
  * gamma: [N]
@@ -298,6 +307,19 @@ Tensor softmax(const Tensor& x) {
     }
 
     return out;
+}
+
+void gelu_(Tensor& x) {
+    const auto nums = x.numel();
+    const float kSqrt2OverPi = 0.7978845608028654F;
+    const float kCoff = 0.044715F;
+    
+    float* x_ptr = x.ptr();
+    for (size_t i = 0; i < num; ++i) {
+        float a = x_ptr[i];
+        float inner = kSqrt2OverPi * (a + kCoff * a * a * a);
+        x_ptr[i] = 0.5F * a * (1 + std::tanh(inner));
+    }
 }
 
 // [n_heads, S, T]
