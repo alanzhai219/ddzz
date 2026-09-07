@@ -20,6 +20,19 @@ std::vector<float> GPT2::forward(const std::vector<int>& tokens, size_t n_past) 
     for (size_t l = 0; l < m_w.config.n_layer; ++l) {
         transformer(l, x, n_past);
     }
+
+    // update cache len
+    m_cache_len = n_past + S;
+    
+    // logits gen
+    // [S, N]
+    Tensor x_ln = ops::layer_norm(x, m_w.ln_f_w, m_w.ln_f_b);
+
+    const size_t n_vocab = m_w.config.vocab_size > 0 ? w_.config.vocab_size : m_w.wte.dim(0);
+    const float* x_last_token = x_ln.ptr() + (S - 1) * N;
+    Tensor logits_t = ops::gemv(m_w.wte, x_last_token);
+    std::vector<float> logits(logits_t.ptr(), logits_t.ptr() + N);
+    return logits;
 }
 
 void GPT2::transfomer_layer(size_t layer_id, Tensor& x, size_t n_past) {

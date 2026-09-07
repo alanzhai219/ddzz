@@ -43,5 +43,7 @@ Tensor scale(const Tensor& x, const float s);
 Tensor transpose_2d(const Tensor& x);
 Tensor transpose_3d(const Tensor& x);
 
+Tensor gemv(const Tensor& x, const float* v);
+
 }
 }

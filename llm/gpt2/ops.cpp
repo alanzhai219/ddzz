@@ -389,5 +389,21 @@ Tensor transpose_3d(const Tensor& x) {
     return out;
 }
 
+// [n_vocab, n_embd] * [n_embd]
+Tensor gemv(const Tensor& x, const float* v) {
+    const size_t dim0 = x.dim(0);  
+    const size_t reduced_dim = x.dim(1); 
+    Tensor out({dim0, 1}, 0.0F);
+    float* out_ptr = out.ptr();
+    float* src0_ptr = x.ptr();
+
+    for (size_t i = 0; i < dim0; ++i) {
+        for (size_t r = 0; r < reduced_dim; ++r) {
+            out_ptr[i] += src0_ptr[i * reduced_dim + r] * v[r];
+        }
+    }
+    return out;
+}
+
 } // namespace ops
 } // namespace gpt2
