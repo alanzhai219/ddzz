@@ -1,10 +1,13 @@
 #pragma once
 
 #include <vector>
+#include <string>
+#include <random>
 
 #include "kvcache.hpp"
 #include "tensor.hpp"
 #include "weights.hpp"
+#include "tokenizer.hpp"
 
 namespace gpt2 {
 
@@ -21,11 +24,16 @@ public:
     void attn(size_t layer_id, Tensor& x, size_t n_past);
     void mlp(size_t layer_id, Tensor& x, size_t n_past);
 
+    int temperature_search(const std::vector<float>& logits, float temperature, int top_k);
+    std::string generate(const tk::Tokenizer& token, const std::string& prompt,
+                         int max_tokens, float temperature, int top_k, size_t seed);
+    
 private:
     GPT2Weights m_w;
     size_t m_hidden_dim;
     KVCACHE m_kv_cache;
     float m_scale = 0.0F;
+    std::mt19937_t m_rnd;
 };
 
 }   // namespace gpt2

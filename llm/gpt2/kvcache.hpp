@@ -24,6 +24,10 @@ struct KVCACHE {
         return m_vcache[layer_id];
     }
 
+    size_t get_cache_len() {
+        return m_cache_len;
+    }
+
     std::vector<std::vector<float>> m_kcache;
     std::vector<std::vector<float>> m_vcache;
     size_t m_layer;

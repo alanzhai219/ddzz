@@ -114,6 +114,78 @@ void GPT2::mlp(size_t layer_id, Tensor& x, size_t n_past) {
     ops::add_(x, mlp_down);
 }
 
+int GPT2::temperature_search(const std::vector<float>& logits, float temperature, int top_k) {
+    if (logits.empty()) {
+        throw std::runtime_error("[temperature_search] logits is empty!");
+    }
+
+    if (temperaure <= 0.F) {
+        throw std::runtime_error("[temperature_search] temperature <= 0");
+    }
+
+    if (top_k <= 0) {
+        throw std::runtime_error("[temperature_search] top_k <= 0");
+    }
+
+    // step1: top_k
+    const auto candidate_count = std::min(static_cast<size_t>(top_k), logits.size());
+    std::vector<size_t> candidate_ids(logits.size());
+    std::itoa(candidate_ids.begin(), candidate_ids.end(), 0);
+    // select top_k
+    std::partial_sort(candidate_ids.begin(), candidate_ids.begin() + top_k, candidate_ids.end(),
+                [&](int a, int b) {
+                    return logits[a] > logits[b];
+                });
+    candidate_ids.resize(candidate_count);
+
+    // step2: prob
+    const float max_val = logits[candidate_ids.front()];
+    std::vector<float> prob;
+    prob.resize(candidate_count);
+    for (auto cur_id : candidate_ids) {
+        prob.push_back(
+                std::exp((logits[cur_id] - max_val) / temperature)
+            );
+    }
+
+    // step3: select
+    std::discrete_distribution<size_t> rnd_gen(prob.begin(), prob.end());
+    return candidate_ids[rnd_gen(m_rnd)];
+}
+
+std::string generate(const tk::Tokenizer& token_obj, const std::string& prompt,
+                     int max_tokens, float temperature, int top_k, size_t seed) {
+    constexpr size_t MAX_LENGTH = 50256;
+
+    m_rnd(seed);
+
+    m_kv_cache.reset();
+
+    // step1: Encode the prompt
+    std::vector<int> output_id = token_obj.encode(prompt);
+    if (output_id.empty()) {
+        output_id.push_back(MAX_LENGTH);
+    }
+
+    if (max_tokens > 0) {
+        output_id.reserve(output_id.size() + static_cast<size_t>(max_tokens));
+    }
+
+    // step2: do the first token
+    std::vector<float> logits = this->forward(output_id, /*past_n*/ 0);
+
+    // step3: do the next token
+    for (int step = 0; step < max_tokens; ++step) {
+        const int next = temperature_search(logits, temperature, top_k);
+        output_id.push_back(next); 
+        if (next == MAX_LENGTH) {
+            break;
+        }
+        logits = this->forward({next}, m_kv_cache.get_cache_len());
+    }
+
+    // step4: decode
+    return token_obj.decode(output_id);
 }
 
 }   // namespace gpt2
