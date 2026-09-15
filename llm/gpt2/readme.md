@@ -12,3 +12,8 @@ curl -L -o model.safetensors "https://huggingface.co/openai-community/gpt2/resol
 cd ..
 ```
 > If failed to download the model files, you can access the above urls and download them manually.
+
+## run
+```
+./build/gpt2 generate "Hello World!" --max-tokens 50 --temp 0.8 --top-k 40 --seed 42
+```

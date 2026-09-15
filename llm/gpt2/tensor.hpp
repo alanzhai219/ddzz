@@ -1,7 +1,7 @@
 #pragma once
 
 #include <cstddef>
-#include <cassert>
+#include <stdexcept>
 #include <vector>
 #include <string>
 namespace gpt2 {
@@ -22,6 +22,7 @@ struct Tensor {
     // idx of vec: 0, 1, 2, ..., n-2, n-1
     void compute_strides() {
         m_stride.resize(m_shape.size()); 
+        if (m_shape.empty()) return;
         m_stride.back() = 1;
         for (size_t idx = m_shape.size() - 1; idx > 0; --idx) {
             m_stride[idx - 1] = m_stride[idx] * m_shape[idx];
@@ -29,7 +30,11 @@ struct Tensor {
     }
 
     void reshape(const std::vector<size_t>& shape) {
-        assert(numel(shape) == m_data.size());
+        size_t count = 1;
+        for (size_t dim : shape) count *= dim;
+        if (count != m_data.size()) {
+            throw std::invalid_argument("Tensor::reshape: element count mismatch");
+        }
         m_shape = shape;
         compute_strides();
     }
@@ -39,7 +44,15 @@ struct Tensor {
         return m_data;
     }
 
+    std::vector<float>& data() {
+        return m_data;
+    }
+
     float* ptr() {
+        return m_data.data();
+    }
+
+    const float* ptr() const {
         return m_data.data();
     }
 
@@ -73,7 +86,7 @@ struct Tensor {
     }
 
     size_t dim(size_t idx) const {
-        assert(idx < m_shape.size());
+        if (idx >= m_shape.size()) throw std::out_of_range("Tensor::dim");
         return m_shape[idx];
     }
 
@@ -98,31 +111,34 @@ struct Tensor {
     }
 
     // access tensor data by index
-    float at(size_t i, size_t j, size_t k, size_t l) {
+    float& at(size_t i, size_t j, size_t k, size_t l) {
         const size_t offset = i * m_stride[0] + j * m_stride[1] + k * m_stride[2] + l * m_stride[3];
         return m_data[offset];
     }
 
-    float at(size_t i, size_t j, size_t k) {
+    float& at(size_t i, size_t j, size_t k) {
         const size_t offset = i * m_stride[0] + j * m_stride[1] + k * m_stride[2];
         return m_data[offset];
     }
 
-    float at(size_t i, size_t j) {
+    float& at(size_t i, size_t j) {
         const size_t offset = i * m_stride[0] + j * m_stride[1];
         return m_data[offset];
     }
 
     float at(size_t i, size_t j, size_t k, size_t l) const {
-        return at(i, j, k, l);
+        const size_t offset = i * m_stride[0] + j * m_stride[1] + k * m_stride[2] + l * m_stride[3];
+        return m_data[offset];
     }
 
     float at(size_t i, size_t j, size_t k) const {
-        return at(i, j, k);
+        const size_t offset = i * m_stride[0] + j * m_stride[1] + k * m_stride[2];
+        return m_data[offset];
     }
 
     float at(size_t i, size_t j) const {
-        return at(i, j);
+        const size_t offset = i * m_stride[0] + j * m_stride[1];
+        return m_data[offset];
     }
 
 private:

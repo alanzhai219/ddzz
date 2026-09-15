@@ -36,5 +36,6 @@ struct GPT2Weights {
 std::unordered_map<std::string, Tensor> load_safetensors(const std::string& filename);
 
 // build tensors to GPT2Weights
-GPT2Weights build_gpt2_weights(const std::unordered_map<std::string, Tensor>& tensors, const GPT2Config& config);
+GPT2Weights build_gpt2_weights(std::unordered_map<std::string, Tensor> tensors,
+                               const GPT2Config& config);
 } // namespace gpt2

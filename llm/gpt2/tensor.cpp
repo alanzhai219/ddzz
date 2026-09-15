@@ -1,11 +1,14 @@
 #include <cassert>
+#include <utility>
 #include "tensor.hpp"
 
 namespace gpt2 {
 
 Tensor::Tensor(const std::vector<size_t>& shape, float fill) {
    m_shape = shape;
-   m_data.resize(numel(shape));
+   size_t count = 1;
+   for (size_t dim : shape) count *= dim;
+   m_data.resize(count);
    for (auto &v : m_data) {
       v = fill; 
    }
@@ -13,8 +16,8 @@ Tensor::Tensor(const std::vector<size_t>& shape, float fill) {
 }
 
 Tensor::Tensor(const std::vector<size_t>& shape, const std::vector<float>& value) {
-   assert(numel() == value.size());
    m_shape = shape;
+   assert(numel() == value.size());
    m_data = value;
    compute_strides();
 }

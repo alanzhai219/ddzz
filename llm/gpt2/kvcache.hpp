@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <vector>
 
 namespace gpt2 {
@@ -24,8 +25,12 @@ struct KVCACHE {
         return m_vcache[layer_id];
     }
 
-    size_t get_cache_len() {
+    size_t get_cache_len() const {
         return m_cache_len;
+    }
+
+    void set_cache_len(size_t cache_len) {
+        m_cache_len = cache_len;
     }
 
     std::vector<std::vector<float>> m_kcache;
