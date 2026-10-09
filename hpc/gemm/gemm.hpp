@@ -74,56 +74,6 @@ static inline int min_int(int a, int b) {
     return std::min(a, b);
 }
 
-
-// ============================================================
-// Packing A
-// ============================================================
-//
-// Original A:
-//
-//     A[mc][kc]
-//
-// row-major:
-//
-//     A[i * lda + k]
-//
-// The micro-kernel wants:
-//
-//     A[:, k]
-//
-// to be contiguous.
-//
-// Therefore we pack A as:
-//
-//     Ap[k][i]
-//
-// Memory:
-//
-//     k=0: A[0,0] A[1,0] A[2,0] ... A[mc-1,0]
-//     k=1: A[0,1] A[1,1] A[2,1] ... A[mc-1,1]
-//     ...
-//
-// Thus:
-//
-//     Ap[k * mc + i]
-//
-// gives A[i,k].
-//
-// This changes the access pattern from:
-//
-//     original:
-//         A[i * lda + k]
-//
-// to:
-//
-//     packed:
-//         Ap[k * mc + i]
-//
-// which makes the MR elements required by the micro-kernel
-// contiguous.
-//
-// ============================================================
-
 void pack_A(const float* A, int lda, float* Ap, int mc, int kc)
 {
     for (int k = 0; k < kc; ++k) {
@@ -133,46 +83,6 @@ void pack_A(const float* A, int lda, float* Ap, int mc, int kc)
     }
 }
 
-
-// ============================================================
-// Packing B
-// ============================================================
-//
-// Original B:
-//
-//     B[k][j]
-//
-// row-major:
-//
-//     B[k * ldb + j]
-//
-// The micro-kernel processes NR=16 columns at once.
-//
-// Therefore we want:
-//
-//     B[k][j ... j+15]
-//
-// to be contiguous.
-//
-// Packed B:
-//
-//     Bp[k][j]
-//
-// Memory:
-//
-//     k=0:
-//         b00 b01 b02 ... b15
-//
-//     k=1:
-//         b10 b11 b12 ... b15
-//
-// etc.
-//
-// Therefore:
-//
-//     Bp[k * nc + j]
-//
-// ============================================================
 
 void pack_B(const float* B, int ldb, float* Bp, int kc, int nc)
 {
@@ -226,7 +136,6 @@ void pack_B(const float* B, int ldb, float* Bp, int kc, int nc)
 //
 // gives a 6×16 matrix.
 //
-//
 // AVX2:
 //
 //     one __m256 = 8 floats
@@ -268,18 +177,12 @@ static inline void micro_kernel_6x16(int K, const float* Ap, const float* Bp,
     // K loop.
     // --------------------------------------------------------
 
-    __m256 c00 = _mm256_loadu_ps(C + 0 * ldc + 0);
-    __m256 c01 = _mm256_loadu_ps(C + 0 * ldc + 8);
-    __m256 c10 = _mm256_loadu_ps(C + 1 * ldc + 0);
-    __m256 c11 = _mm256_loadu_ps(C + 1 * ldc + 8);
-    __m256 c20 = _mm256_loadu_ps(C + 2 * ldc + 0);
-    __m256 c21 = _mm256_loadu_ps(C + 2 * ldc + 8);
-    __m256 c30 = _mm256_loadu_ps(C + 3 * ldc + 0);
-    __m256 c31 = _mm256_loadu_ps(C + 3 * ldc + 8);
-    __m256 c40 = _mm256_loadu_ps(C + 4 * ldc + 0);
-    __m256 c41 = _mm256_loadu_ps(C + 4 * ldc + 8);
-    __m256 c50 = _mm256_loadu_ps(C + 5 * ldc + 0);
-    __m256 c51 = _mm256_loadu_ps(C + 5 * ldc + 8);
+    __m256 c00 = _mm256_loadu_ps(C + 0 * ldc + 0); __m256 c01 = _mm256_loadu_ps(C + 0 * ldc + 8);
+    __m256 c10 = _mm256_loadu_ps(C + 1 * ldc + 0); __m256 c11 = _mm256_loadu_ps(C + 1 * ldc + 8);
+    __m256 c20 = _mm256_loadu_ps(C + 2 * ldc + 0); __m256 c21 = _mm256_loadu_ps(C + 2 * ldc + 8);
+    __m256 c30 = _mm256_loadu_ps(C + 3 * ldc + 0); __m256 c31 = _mm256_loadu_ps(C + 3 * ldc + 8);
+    __m256 c40 = _mm256_loadu_ps(C + 4 * ldc + 0); __m256 c41 = _mm256_loadu_ps(C + 4 * ldc + 8);
+    __m256 c50 = _mm256_loadu_ps(C + 5 * ldc + 0); __m256 c51 = _mm256_loadu_ps(C + 5 * ldc + 8);
 
     // --------------------------------------------------------
     // K loop
@@ -488,26 +391,18 @@ static inline void micro_kernel_edge(int mr, int nr, int K, const float* Ap,
 //
 // Macro-kernel divides the large block:
 //
-//     MC × NC
-//
-// into:
-//
-//     MR × NR
+//     MC × NC  =>  MR × NR
 //
 // micro-blocks.
 //
-//
-//
-//     MC=96
-//
-//     ┌──────┬──────┬──────┬──────┐
-//     │6×16  │6×16  │6×16  │ ...  │
-//     ├──────┼──────┼──────┼──────┤
-//     │6×16  │6×16  │6×16  │ ...  │
-//     ├──────┼──────┼──────┼──────┤
-//     │ ...  │ ...  │ ...  │ ...  │
-//     └──────┴──────┴──────┴──────┘
-//                         NC=128
+//         ┌──────┬──────┬──────┬──────┐
+//         │6×16  │6×16  │6×16  │ ...  │
+//         ├──────┼──────┼──────┼──────┤
+//  MC=96  │6×16  │6×16  │6×16  │ ...  │
+//         ├──────┼──────┼──────┼──────┤
+//         │ ...  │ ...  │ ...  │ ...  │
+//         └──────┴──────┴──────┴──────┘
+//                     NC=128
 //
 // ============================================================
 
@@ -522,14 +417,12 @@ void macro_kernel(int mc, int nc, int kc, const float* Ap, const float* Bp,
             // ------------------------------------------------
             // Full 6×16 block
             // ------------------------------------------------
-
+            // follow kc loop, and compute the outer product of A[:,k] and B[k,:]
             if (mr == MR && nr == NR) {
-                micro_kernel_6x16(kc, Ap + i, Bp + j, C + i * ldc + j,
-                                  ldc, mc, nc);
+                micro_kernel_6x16(kc, Ap + i, Bp + j, C + i * ldc + j, ldc, mc, nc);
             } else {
                 // Fringe / edge block
-                micro_kernel_edge(mr, nr, kc, Ap + i, Bp + j,
-                                  C + i * ldc + j, ldc, mc, nc);
+                micro_kernel_edge(mr, nr, kc, Ap + i, Bp + j, C + i * ldc + j, ldc, mc, nc);
             }
         }
     }
@@ -559,38 +452,27 @@ void macro_kernel(int mc, int nc, int kc, const float* Ap, const float* Bp,
 // ============================================================
 
 void gemm(int M, int N, int K, const float* A, int lda,
-          const float* B, int ldb, float* C, int ldc)
-{
-    if (M <= 0 || N <= 0) return;
+          const float* B, int ldb, float* C, int ldc) {
+    if (M <= 0 || N <= 0 || K <= 0) {
+        return;
+    }
 
     // C = A * B: initialize only the active columns, preserving row padding.
     // Every kernel can then load C for both the first and subsequent K blocks.
     for (int i = 0; i < M; ++i) {
         std::fill_n(C + i * ldc, N, 0.0f);
     }
-    if (K <= 0) return;
 
     // --------------------------------------------------------
     // Allocate packing buffers.
-    //
-    // Ap:
-    //
-    //     MC × KC
-    //
-    // Bp:
-    //
-    //     KC × NC
-    //
+    // Ap: MC × KC
+    // Bp: KC × NC
     // --------------------------------------------------------
-
     std::vector<float> Ap(static_cast<size_t>(MC) * KC);
     std::vector<float> Bp(static_cast<size_t>(KC) * NC);
 
     // --------------------------------------------------------
-    // jc loop
-    //
-    // Partition N into NC-sized blocks.
-    //
+    // jc loop: Partition N into NC-sized blocks.
     // This determines which B/C columns we are working on.
     // --------------------------------------------------------
 
@@ -598,46 +480,20 @@ void gemm(int M, int N, int K, const float* A, int lda,
         const int nc = min_int(NC, N - jc);
 
         // ----------------------------------------------------
-        // pc loop
-        //
-        // Partition K into KC-sized blocks.
-        //
+        // pc loop: Partition K into KC-sized blocks.
         // One KC block is packed and reused.
         // ----------------------------------------------------
 
         for (int pc = 0; pc < K; pc += KC) {
             const int kc = min_int(KC, K - pc);
-
-            // ------------------------------------------------
-            // Pack B
-            //
-            // B source:
-            //
-            //     B[pc : pc+kc,
-            //       jc : jc+nc]
-            //
-            // ------------------------------------------------
-
             pack_B(B + pc * ldb + jc, ldb, Bp.data(), kc, nc);
 
             // ------------------------------------------------
-            // ic loop
-            //
-            // Partition M into MC-sized blocks.
+            // ic loop: Partition M into MC-sized blocks.
             // ------------------------------------------------
 
             for (int ic = 0; ic < M; ic += MC) {
                 const int mc = min_int(MC, M - ic);
-
-                // --------------------------------------------
-                // Pack A
-                //
-                // A source:
-                //
-                //     A[ic : ic+mc,
-                //       pc : pc+kc]
-                // --------------------------------------------
-
                 pack_A(A + ic * lda + pc, lda, Ap.data(), mc, kc);
 
                 // --------------------------------------------
@@ -646,15 +502,10 @@ void gemm(int M, int N, int K, const float* A, int lda,
                 // Compute:
                 //
                 //     C[ic:ic+mc,
-                //       jc:jc+nc]
-                //
-                // +=
-                //
-                //     Ap × Bp
+                //       jc:jc+nc] += Ap × Bp
                 // --------------------------------------------
 
-                macro_kernel(mc, nc, kc, Ap.data(), Bp.data(),
-                             C + ic * ldc + jc, ldc);
+                macro_kernel(mc, nc, kc, Ap.data(), Bp.data(), C + ic * ldc + jc, ldc);
             }
         }
     }
